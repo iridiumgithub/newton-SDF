@@ -631,10 +631,29 @@ def main(argv: list[str] | None = None) -> int:
     texture_data = sdf.to_texture_kernel_data()
     coarse_texture = sdf._coarse_texture
     subgrid_texture = sdf._subgrid_texture
+    coarse_texture_dimensions = (
+        [int(coarse_texture.width), int(coarse_texture.height), int(coarse_texture.depth)]
+        if coarse_texture is not None
+        else None
+    )
+    coarse_cell_dimensions = (
+        [dimension - 1 for dimension in coarse_texture_dimensions]
+        if coarse_texture_dimensions is not None
+        else None
+    )
+    subgrid_size = int(texture_data.subgrid_size)
+    fine_grid_cell_dimensions = (
+        [dimension * subgrid_size for dimension in coarse_cell_dimensions]
+        if coarse_cell_dimensions is not None
+        else None
+    )
     sample_info["texture_layout"] = {
-        "coarse_texture_dimensions": (
-            [int(coarse_texture.width), int(coarse_texture.height), int(coarse_texture.depth)]
-            if coarse_texture is not None
+        "coarse_texture_dimensions": coarse_texture_dimensions,
+        "coarse_cell_dimensions": coarse_cell_dimensions,
+        "fine_grid_cell_dimensions": fine_grid_cell_dimensions,
+        "fine_grid_sample_dimensions": (
+            [dimension + 1 for dimension in fine_grid_cell_dimensions]
+            if fine_grid_cell_dimensions is not None
             else None
         ),
         "subgrid_texture_dimensions": (
@@ -642,7 +661,7 @@ def main(argv: list[str] | None = None) -> int:
             if subgrid_texture is not None
             else None
         ),
-        "subgrid_size": int(texture_data.subgrid_size),
+        "subgrid_size": subgrid_size,
         "num_subgrids": int(texture_data.num_subgrids),
         "paired_samples": bool(texture_data.paired_samples),
     }

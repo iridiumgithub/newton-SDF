@@ -33,6 +33,8 @@ from newton._src.geometry.sdf_texture import (
     texture_sample_sdf_at_voxel,
     texture_sample_sdf_grad,
     texture_sample_sdf_hw,
+    _combine_dual_sdf_values,
+    _select_dual_sdf_gradient,
 )
 from newton._src.geometry.sdf_utils import (
     SDFData,
@@ -1889,6 +1891,71 @@ def test_texture_sdf_sign_mode_normal_open_mesh(test, device):
     test.assertGreater(float(values[1]), 0.0, f"exterior probe should be outside, got {values[1]}")
 
 
+
+@wp.kernel
+def _dual_field_composition_kernel(
+    distance_a: wp.array[float],
+    distance_b: wp.array[float],
+    gradient_a: wp.array[wp.vec3],
+    gradient_b: wp.array[wp.vec3],
+    combined_distance: wp.array[float],
+    combined_gradient: wp.array[wp.vec3],
+):
+    tid = wp.tid()
+    a = distance_a[tid]
+    b = distance_b[tid]
+    combined_distance[tid] = _combine_dual_sdf_values(a, b)
+    combined_gradient[tid] = _select_dual_sdf_gradient(a, gradient_a[tid], b, gradient_b[tid])
+
+
+def test_dual_field_preserves_two_zero_crossings(test, device):
+    """Interpolating fields independently preserves a thin slab lost by max-first sampling.
+
+    At the two coarse endpoints, max(A, B) is positive. Interpolating that
+    already-combined scalar field therefore stays positive. Interpolating A
+    and B independently at the midpoint gives two negative values, whose max
+    correctly identifies the material interval.
+    """
+    # Endpoints of a one-dimensional cell: A decreases, B increases.
+    field_a_endpoints = np.array([0.4, -0.6], dtype=np.float32)
+    field_b_endpoints = np.array([-0.6, 0.4], dtype=np.float32)
+
+    # Midpoint values from independent linear interpolation.
+    midpoint_a = float(field_a_endpoints.mean())
+    midpoint_b = float(field_b_endpoints.mean())
+    dual_midpoint = max(midpoint_a, midpoint_b)
+
+    # The original single field combines first, then interpolates.
+    single_endpoints = np.maximum(field_a_endpoints, field_b_endpoints)
+    single_midpoint = float(single_endpoints.mean())
+
+    test.assertLess(dual_midpoint, 0.0)
+    test.assertGreater(single_midpoint, 0.0)
+    test.assertAlmostEqual(dual_midpoint, -0.1, places=6)
+    test.assertAlmostEqual(single_midpoint, 0.4, places=6)
+
+    # Also exercise the Warp device-side composition and active-gradient rule.
+    distance_a = wp.array([midpoint_a, 0.2], dtype=wp.float32, device=device)
+    distance_b = wp.array([midpoint_b, -0.3], dtype=wp.float32, device=device)
+    gradient_a = wp.array([wp.vec3(1.0, 0.0, 0.0), wp.vec3(0.0, 1.0, 0.0)], dtype=wp.vec3, device=device)
+    gradient_b = wp.array([wp.vec3(-1.0, 0.0, 0.0), wp.vec3(0.0, 0.0, 1.0)], dtype=wp.vec3, device=device)
+    out_distance = wp.empty(2, dtype=wp.float32, device=device)
+    out_gradient = wp.empty(2, dtype=wp.vec3, device=device)
+    wp.launch(
+        _dual_field_composition_kernel,
+        dim=2,
+        inputs=[distance_a, distance_b, gradient_a, gradient_b, out_distance, out_gradient],
+        device=device,
+    )
+
+    np.testing.assert_allclose(out_distance.numpy(), np.array([-0.1, 0.2], dtype=np.float32), atol=1e-6)
+    np.testing.assert_allclose(
+        out_gradient.numpy(),
+        np.array([[1.0, 0.0, 0.0], [0.0, 1.0, 0.0]], dtype=np.float32),
+        atol=1e-6,
+    )
+
+
 # Register tests for CUDA devices
 devices = get_cuda_test_devices()
 add_function_test(TestTextureSDF, "test_texture_sdf_construction", test_texture_sdf_construction, devices=devices)
@@ -2022,6 +2089,13 @@ add_function_test(
     TestTextureSDF,
     "test_texture_sdf_vs_ground_truth_gradient",
     test_texture_sdf_vs_ground_truth_gradient,
+    devices=devices,
+)
+
+add_function_test(
+    TestTextureSDF,
+    "test_dual_field_preserves_two_zero_crossings",
+    test_dual_field_preserves_two_zero_crossings,
     devices=devices,
 )
 

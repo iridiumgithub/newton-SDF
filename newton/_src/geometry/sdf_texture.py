@@ -3371,7 +3371,9 @@ def texture_sample_sdf_dual_grad(
     """
     distance_a, gradient_a = texture_sample_sdf_grad(sdf_a, local_pos)
     distance_b, gradient_b = texture_sample_sdf_grad(sdf_b, local_pos)
-    return distance_a, _select_dual_sdf_gradient(distance_a, gradient_a, distance_b, gradient_b)
+    distance = _combine_dual_sdf_values(distance_a, distance_b)
+    gradient = _select_dual_sdf_gradient(distance_a, gradient_a, distance_b, gradient_b)
+    return distance, gradient
 
 
 @wp.func
@@ -3395,8 +3397,6 @@ def texture_sample_sdf_dual_grad_hw(
     """Hardware-filtered dual-field value and active-field finite-difference gradient."""
     distance_a = texture_sample_sdf_hw(sdf_a, local_pos)
     distance_b = texture_sample_sdf_hw(sdf_b, local_pos)
-    gradient_a = texture_sample_sdf_grad_only_hw(sdf_a, local_pos)
-    gradient_b = texture_sample_sdf_grad_only_hw(sdf_b, local_pos)
-    return distance_a if distance_a >= distance_b else distance_b, _select_dual_sdf_gradient(
-        distance_a, gradient_a, distance_b, gradient_b
-    )
+    if distance_a >= distance_b:
+        return distance_a, texture_sample_sdf_grad_only_hw(sdf_a, local_pos)
+    return distance_b, texture_sample_sdf_grad_only_hw(sdf_b, local_pos)

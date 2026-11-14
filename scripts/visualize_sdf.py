@@ -103,6 +103,8 @@ def _write_vtp(path: Path, points: np.ndarray, faces: np.ndarray) -> None:
         },
     )
 
+    ET.SubElement(piece, "PointData")
+    ET.SubElement(piece, "CellData")
     points_element = ET.SubElement(piece, "Points")
     points_array = ET.SubElement(
         points_element,
@@ -111,6 +113,9 @@ def _write_vtp(path: Path, points: np.ndarray, faces: np.ndarray) -> None:
     )
     points_array.text = _vtk_binary(points, "<f4")
 
+    ET.SubElement(piece, "Verts")
+    ET.SubElement(piece, "Lines")
+    ET.SubElement(piece, "Strips")
     polys = ET.SubElement(piece, "Polys")
     connectivity = ET.SubElement(
         polys,
@@ -525,6 +530,10 @@ def main(argv: list[str] | None = None) -> int:
         parser.error("--narrow-band must be positive.")
     if args.volume_resolution < 2 or args.slice_resolution < 2:
         parser.error("Visualization resolutions must be at least 2.")
+    if args.max_volume_points < 8:
+        parser.error("--max-volume-points must be at least 8.")
+    if args.max_slice_points < 4:
+        parser.error("--max-slice-points must be at least 4.")
 
     if not wp.is_cuda_available():
         raise RuntimeError(

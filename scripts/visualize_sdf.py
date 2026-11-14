@@ -234,6 +234,8 @@ def _fit_slice_dims(
         raise ValueError("Slice axes must have positive extent.")
 
     low, high = 2, requested_resolution
+    if max_points < 4:
+        raise ValueError("Maximum slice sample count must be at least 4.")
     best = (2, 2)
     while low <= high:
         mid = (low + high) // 2
@@ -355,7 +357,6 @@ def _export_sdf_diagnostics(
         "subgrid_size": int(texture_data.subgrid_size),
         "num_subgrids": int(texture_data.num_subgrids),
         "paired_samples": bool(texture_data.paired_samples),
-        "texture_format": None,
         "sampled_datasets": {},
     }
 
@@ -428,7 +429,7 @@ def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description="Build a Newton texture SDF from an STL and export ParaView diagnostics."
     )
-    parser.add_argument("--input", type=Path, required=True, help="Input STL file.")
+    parser.add_argument("--input", "--case", dest="input", type=Path, required=True, help="Input STL case file.")
     parser.add_argument("--output", type=Path, required=True, help="Output directory.")
     parser.add_argument(
         "--input-unit",
@@ -543,7 +544,9 @@ def main(argv: list[str] | None = None) -> int:
         f"  Vertices: {mesh_info['vertex_count']}, triangles: {mesh_info['triangle_count']}, "
         f"watertight: {mesh_info['watertight']}"
     )
-    if not mesh_info["watertight"] and args.sign_method in ("auto", "parity"):
+    if not mesh_info["watertight"] and args.sign_method == "auto":
+        print("  WARNING: mesh is not watertight; auto mode will use winding-number signs. Inspect the exported slices.")
+    elif not mesh_info["watertight"] and args.sign_method == "parity":
         print("  WARNING: mesh is not watertight; parity signs may be unreliable. Consider --sign-method normal.")
 
     print(f"[2/5] Building Newton texture SDF on {device} ...")
@@ -644,7 +647,10 @@ def main(argv: list[str] | None = None) -> int:
             "target_voxel_size_m": args.target_voxel_size,
             "margin_m": args.margin,
             "narrow_band_range_m": [-args.narrow_band, args.narrow_band],
-            "sign_method": args.sign_method,
+            "sign_method_requested": args.sign_method,
+            "sign_method_resolved": (
+                "parity" if mesh_info["watertight"] else "winding"
+            ) if args.sign_method == "auto" else args.sign_method,
             "texture_format": args.texture_format,
             "paired_samples": not args.no_paired_samples,
             "build_seconds": build_seconds,
@@ -669,23 +675,33 @@ def main(argv: list[str] | None = None) -> int:
     metadata_path = output_dir / "metadata.json"
     metadata_path.write_text(json.dumps(metadata, indent=2, ensure_ascii=False), encoding="utf-8")
 
-    readme = """Newton SDF Inspector output
-
-1. Open case.vtm in ParaView to load all datasets together.
-2. Toggle Source STL mesh and Newton extracted zero isosurface to compare geometry.
-3. Select sdf_volume.vti and apply the Contour filter with value 0.0 to extract
-   the zero level set from the sampled interpolated SDF.
-4. Open slices/sdf_slice_xy.vti, sdf_slice_xz.vti, and sdf_slice_yz.vti to inspect
-   signed-distance cross sections. Color by signed_distance_m; the material side
-   should be negative for a correctly oriented closed solid.
-5. Check metadata.json for mesh watertightness, SDF parameters, texture layout,
-   sample dimensions, and value ranges.
-
-The full 3-D volume is capped by --max-volume-points. Center slices use
---slice-resolution and --max-slice-points. Increase SDF resolution or reduce
-target voxel size to improve the actual SDF; increasing visualization sampling
-density alone does not add geometric information to the SDF.
-"""
+    readme_lines = [
+        "Newton SDF Inspector output",
+        "",
+        "1. Open case.vtm in ParaView to load all exported datasets together.",
+        "2. Toggle Source STL mesh and Newton extracted zero isosurface to compare geometry.",
+    ]
+    if not args.no_volume:
+        readme_lines.extend([
+            "3. Select sdf_volume.vti and apply the Contour filter with value 0.0 to extract",
+            "   the zero level set from the sampled interpolated SDF.",
+        ])
+    if not args.no_slices:
+        readme_lines.extend([
+            "4. Open the three files under slices/ to inspect signed-distance cross sections.",
+            "   Color by signed_distance_m; the material side should be negative for a correctly",
+            "   oriented closed solid.",
+        ])
+    readme_lines.extend([
+        "5. Check metadata.json for mesh watertightness, SDF parameters, texture layout,",
+        "   sample dimensions, and value ranges.",
+        "",
+        "The full 3-D volume is capped by --max-volume-points. Center slices use",
+        "--slice-resolution and --max-slice-points. Increase SDF resolution or reduce",
+        "target voxel size to improve the actual SDF; increasing visualization sampling",
+        "density alone does not add geometric information to the SDF.",
+    ])
+    readme = "\\n".join(readme_lines) + "\\n"
     (output_dir / "README.txt").write_text(readme, encoding="utf-8")
 
     print("")

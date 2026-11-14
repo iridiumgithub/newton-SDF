@@ -41,6 +41,21 @@ python scripts/visualize_sdf.py \
 
 `--target-voxel-size` 与 `--resolution` 互斥，单位为米。长细结构应优先考虑物理体素尺寸，而不是只看最长轴分辨率。
 
+对于壁厚约 2.5 mm 的薄壁结构，可以先尝试 0.5 mm 的目标体素尺寸（壁厚方向约有 5 个采样间隔），并将窄带控制在 5 mm 左右：
+
+```bash
+python scripts/visualize_sdf.py \
+  --input cases/hollow_cylinder.stl \
+  --output outputs/hollow_cylinder_0p5mm \
+  --input-unit m \
+  --target-voxel-size 0.0005 \
+  --margin 0.01 \
+  --narrow-band 0.005 \
+  --slice-resolution 768
+```
+
+这是用于诊断的起始参数，不是对所有 STL 的最佳配置。高分辨率会增加 SDF 构建时间和显存占用；建议先用较低分辨率确认流程，再逐步减小体素尺寸。
+
 ## 输出文件
 
 ```text
@@ -68,7 +83,7 @@ outputs/hollow_cylinder/
 
 1. 打开 `case.vtm`。
 2. 对比 `Source STL mesh` 与 `Newton extracted zero isosurface`，检查零面是否缺失、断裂或偏移。
-3. 选中 `sdf_volume.vti`，应用 Contour Filter，将等值设为 `0.0)，得到基于导出标量场的零面。
+3. 选中 `sdf_volume.vti`，应用 Contour Filter，将等值设为 `0.0`，得到基于导出标量场的零面。
 4. 分别打开三个中心剖面，按 `signed_distance_m` 着色。对于闭合实体，材料内部应为负值，外部应为正值。
 5. 查看 `metadata.json`，确认 STL 单位、watertight 状态、体素尺寸、Subgrid 数量及采样范围。
 

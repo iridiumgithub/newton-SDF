@@ -3315,6 +3315,27 @@ def compute_isomesh_from_texture_sdf(
 
 
 @wp.func
+def _combine_dual_sdf_values(distance_a: float, distance_b: float) -> float:
+    """Intersection composition for two independently interpolated fields."""
+    if distance_a >= distance_b:
+        return distance_a
+    return distance_b
+
+
+@wp.func
+def _select_dual_sdf_gradient(
+    distance_a: float,
+    gradient_a: wp.vec3,
+    distance_b: float,
+    gradient_b: wp.vec3,
+) -> wp.vec3:
+    """Select the active branch gradient of max(A, B); ties prefer A."""
+    if distance_a >= distance_b:
+        return gradient_a
+    return gradient_b
+
+
+@wp.func
 def texture_sample_sdf_dual(
     sdf_a: TextureSDFData,
     sdf_b: TextureSDFData,
@@ -3333,9 +3354,7 @@ def texture_sample_sdf_dual(
     """
     distance_a = texture_sample_sdf(sdf_a, local_pos)
     distance_b = texture_sample_sdf(sdf_b, local_pos)
-    if distance_a >= distance_b:
-        return distance_a
-    return distance_b
+    return _combine_dual_sdf_values(distance_a, distance_b)
 
 
 @wp.func
@@ -3352,9 +3371,7 @@ def texture_sample_sdf_dual_grad(
     """
     distance_a, gradient_a = texture_sample_sdf_grad(sdf_a, local_pos)
     distance_b, gradient_b = texture_sample_sdf_grad(sdf_b, local_pos)
-    if distance_a >= distance_b:
-        return distance_a, gradient_a
-    return distance_b, gradient_b
+    return distance_a, _select_dual_sdf_gradient(distance_a, gradient_a, distance_b, gradient_b)
 
 
 @wp.func
@@ -3366,9 +3383,7 @@ def texture_sample_sdf_dual_hw(
     """Hardware-filtered counterpart of :func:`texture_sample_sdf_dual`."""
     distance_a = texture_sample_sdf_hw(sdf_a, local_pos)
     distance_b = texture_sample_sdf_hw(sdf_b, local_pos)
-    if distance_a >= distance_b:
-        return distance_a
-    return distance_b
+    return _combine_dual_sdf_values(distance_a, distance_b)
 
 
 @wp.func
@@ -3380,6 +3395,8 @@ def texture_sample_sdf_dual_grad_hw(
     """Hardware-filtered dual-field value and active-field finite-difference gradient."""
     distance_a = texture_sample_sdf_hw(sdf_a, local_pos)
     distance_b = texture_sample_sdf_hw(sdf_b, local_pos)
-    if distance_a >= distance_b:
-        return distance_a, texture_sample_sdf_grad_only_hw(sdf_a, local_pos)
-    return distance_b, texture_sample_sdf_grad_only_hw(sdf_b, local_pos)
+    gradient_a = texture_sample_sdf_grad_only_hw(sdf_a, local_pos)
+    gradient_b = texture_sample_sdf_grad_only_hw(sdf_b, local_pos)
+    return distance_a if distance_a >= distance_b else distance_b, _select_dual_sdf_gradient(
+        distance_a, gradient_a, distance_b, gradient_b
+    )

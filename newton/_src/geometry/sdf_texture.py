@@ -3308,3 +3308,78 @@ def compute_isomesh_from_texture_sdf(
     faces_np = np.arange(3 * num_faces).reshape(-1, 3)
     faces_np = faces_np[:, ::-1]
     return Mesh(verts_np, faces_np)
+
+# ============================================================================
+# Experimental dual-field sampling
+# ============================================================================
+
+
+@wp.func
+def texture_sample_sdf_dual(
+    sdf_a: TextureSDFData,
+    sdf_b: TextureSDFData,
+    local_pos: wp.vec3,
+) -> float:
+    """Sample two independently baked fields and combine them as an intersection.
+
+    Both fields must use the same local coordinate frame and their signs must
+    be negative on the material side of their respective oriented surfaces.
+    The max is exact for the signed-distance intersection of parallel planes;
+    for general curved surfaces it is a conservative CSG-style approximation.
+
+    Importantly, each field is interpolated before the max is applied. Taking
+    the max at grid vertices first can erase two zero crossings contained in
+    one cell.
+    """
+    distance_a = texture_sample_sdf(sdf_a, local_pos)
+    distance_b = texture_sample_sdf(sdf_b, local_pos)
+    if distance_a >= distance_b:
+        return distance_a
+    return distance_b
+
+
+@wp.func
+def texture_sample_sdf_dual_grad(
+    sdf_a: TextureSDFData,
+    sdf_b: TextureSDFData,
+    local_pos: wp.vec3,
+) -> tuple[float, wp.vec3]:
+    """Sample the dual-field value and the gradient of its active field.
+
+    At a tie (distance_a == distance_b), field A is selected deterministically.
+    The max field is not differentiable at such ties; selecting either active
+    gradient is a valid one-sided choice for this prototype.
+    """
+    distance_a, gradient_a = texture_sample_sdf_grad(sdf_a, local_pos)
+    distance_b, gradient_b = texture_sample_sdf_grad(sdf_b, local_pos)
+    if distance_a >= distance_b:
+        return distance_a, gradient_a
+    return distance_b, gradient_b
+
+
+@wp.func
+def texture_sample_sdf_dual_hw(
+    sdf_a: TextureSDFData,
+    sdf_b: TextureSDFData,
+    local_pos: wp.vec3,
+) -> float:
+    """Hardware-filtered counterpart of :func:`texture_sample_sdf_dual`."""
+    distance_a = texture_sample_sdf_hw(sdf_a, local_pos)
+    distance_b = texture_sample_sdf_hw(sdf_b, local_pos)
+    if distance_a >= distance_b:
+        return distance_a
+    return distance_b
+
+
+@wp.func
+def texture_sample_sdf_dual_grad_hw(
+    sdf_a: TextureSDFData,
+    sdf_b: TextureSDFData,
+    local_pos: wp.vec3,
+) -> tuple[float, wp.vec3]:
+    """Hardware-filtered dual-field value and active-field finite-difference gradient."""
+    distance_a = texture_sample_sdf_hw(sdf_a, local_pos)
+    distance_b = texture_sample_sdf_hw(sdf_b, local_pos)
+    if distance_a >= distance_b:
+        return distance_a, texture_sample_sdf_grad_only_hw(sdf_a, local_pos)
+    return distance_b, texture_sample_sdf_grad_only_hw(sdf_b, local_pos)

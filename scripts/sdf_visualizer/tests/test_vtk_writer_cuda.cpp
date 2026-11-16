@@ -125,10 +125,10 @@ int main(int argc, char** argv) {
         error,
         sizeof(error));
 
-    const bool cleanup_ok =
-        cuda_check(cudaStreamSynchronize(stream), "cudaStreamSynchronize(test)") &&
-        cuda_check(cudaStreamDestroy(stream), "cudaStreamDestroy") &&
-        cuda_check(cudaFree(device_values), "cudaFree");
+    bool cleanup_ok = true;
+    cleanup_ok &= cuda_check(cudaStreamSynchronize(stream), "cudaStreamSynchronize(test)");
+    cleanup_ok &= cuda_check(cudaStreamDestroy(stream), "cudaStreamDestroy");
+    cleanup_ok &= cuda_check(cudaFree(device_values), "cudaFree");
     if (result != 0) {
         std::cerr << "nsv_write_vti_cuda failed: " << error << "\n";
         return 1;

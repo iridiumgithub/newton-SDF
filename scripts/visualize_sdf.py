@@ -696,11 +696,18 @@ def _export_dual_sdf_diagnostics(
     upper_a = _vec3_to_numpy(texture_a.sdf_box_upper)
     lower_b = _vec3_to_numpy(texture_b.sdf_box_lower)
     upper_b = _vec3_to_numpy(texture_b.sdf_box_upper)
-    lower = np.minimum(lower_a, lower_b)
-    upper = np.maximum(upper_a, upper_b)
+    # Both texture samplers extrapolate positively outside their own AABBs.
+    # Restrict the common grid to the overlap so max(A, B) never relies on
+    # out-of-domain extrapolation from either independently baked field.
+    lower = np.maximum(lower_a, lower_b)
+    upper = np.minimum(upper_a, upper_b)
     extents = upper - lower
     if np.any(extents <= 0.0):
-        raise RuntimeError(f"Invalid dual-field sampling bounds: lower={lower.tolist()}, upper={upper.tolist()}")
+        raise RuntimeError(
+            "The two SDF texture domains do not overlap. Increase --margin (and, if needed, "
+            "--narrow-band) so both independently baked fields cover the intended intersection region. "
+            f"A=[{lower_a.tolist()}, {upper_a.tolist()}], B=[{lower_b.tolist()}, {upper_b.tolist()}]."
+        )
 
     sdf_a_data = wp.array([texture_a], dtype=TextureSDFData, device=device)
     sdf_b_data = wp.array([texture_b], dtype=TextureSDFData, device=device)

@@ -5,10 +5,12 @@
 
 #include <cstdint>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -23,6 +25,43 @@ bool contains_text(const std::filesystem::path& path, const std::string& needle)
         (std::istreambuf_iterator<char>(stream)),
         std::istreambuf_iterator<char>());
     return content.find(needle) != std::string::npos;
+}
+
+std::string read_binary(const std::filesystem::path& path) {
+    std::ifstream stream(path, std::ios::binary);
+    if (!stream) {
+        throw std::runtime_error("Cannot read test output: " + path.string());
+    }
+    return std::string(
+        (std::istreambuf_iterator<char>(stream)),
+        std::istreambuf_iterator<char>());
+}
+
+std::uint64_t read_u64(const std::string& bytes, std::size_t offset) {
+    if (offset + sizeof(std::uint64_t) > bytes.size()) {
+        throw std::runtime_error("Unexpected end of VTK appended data.");
+    }
+    std::uint64_t value{};
+    std::memcpy(&value, bytes.data() + offset, sizeof(value));
+    return value;
+}
+
+float read_float(const std::string& bytes, std::size_t offset) {
+    if (offset + sizeof(float) > bytes.size()) {
+        throw std::runtime_error("Unexpected end of VTK float payload.");
+    }
+    float value{};
+    std::memcpy(&value, bytes.data() + offset, sizeof(value));
+    return value;
+}
+
+std::size_t appended_payload_offset(const std::string& bytes) {
+    constexpr char marker[] = "<AppendedData encoding=\"raw\">_";
+    const auto position = bytes.find(marker);
+    if (position == std::string::npos) {
+        throw std::runtime_error("VTK XML file has no raw appended-data section.");
+    }
+    return position + sizeof(marker) - 1;
 }
 
 void check(int result, const char* error, const char* operation) {
@@ -111,6 +150,29 @@ int main(int argc, char** argv) {
         !contains_text(multiblock_path, "Triangle mesh") ||
         !contains_text(multiblock_path, "volume.vti")) {
         std::cerr << "Native VTK writer smoke test found missing XML metadata.\n";
+        return 1;
+    }
+
+    // Validate UInt64 block headers and representative payload values.
+    const std::string vti_bytes = read_binary(volume_path);
+    const std::size_t vti_data = appended_payload_offset(vti_bytes);
+    if (read_u64(vti_bytes, vti_data) != values.size() * sizeof(float) ||
+        read_float(vti_bytes, vti_data + sizeof(std::uint64_t)) != values.front()) {
+        std::cerr << "VTI raw appended payload validation failed.\n";
+        return 1;
+    }
+
+    const std::string vtp_bytes = read_binary(mesh_path);
+    const std::size_t vtp_data = appended_payload_offset(vtp_bytes);
+    const std::size_t connectivity_header =
+        vtp_data + sizeof(std::uint64_t) + points.size() * sizeof(float);
+    const std::size_t offsets_header =
+        connectivity_header + sizeof(std::uint64_t) + triangles.size() * sizeof(std::int64_t);
+    if (read_u64(vtp_bytes, vtp_data) != points.size() * sizeof(float) ||
+        read_u64(vtp_bytes, connectivity_header) != triangles.size() * sizeof(std::int64_t) ||
+        read_u64(vtp_bytes, offsets_header) != sizeof(std::int64_t) ||
+        read_u64(vtp_bytes, offsets_header + sizeof(std::uint64_t)) != 3) {
+        std::cerr << "VTP raw appended block offsets validation failed.\n";
         return 1;
     }
 

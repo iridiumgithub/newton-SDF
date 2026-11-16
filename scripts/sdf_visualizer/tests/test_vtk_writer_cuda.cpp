@@ -11,6 +11,7 @@
 #include <fstream>
 #include <iostream>
 #include <iterator>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
@@ -87,7 +88,7 @@ int main(int argc, char** argv) {
     };
     float* device_values = nullptr;
     cudaStream_t stream = nullptr;
-    if (!cuda_check(cudaMalloc(&device_values, host_values.size() * sizeof(float)), "cudaMalloc") ||
+    if (!cuda_check(cudaMalloc(reinterpret_cast<void**>(&device_values), host_values.size() * sizeof(float)), "cudaMalloc") ||
         !cuda_check(cudaStreamCreateWithFlags(&stream, cudaStreamNonBlocking), "cudaStreamCreate") ||
         !cuda_check(
             cudaMemcpyAsync(

@@ -45,3 +45,29 @@ jobs:
 
       - name: Run native writer tests
         run: ctest --test-dir build/sdf-visualizer --build-config Release --output-on-failure
+
+  cuda-vtk-writer:
+    name: CUDA Runtime writer build
+    runs-on: ubuntu-latest
+    container:
+      image: nvidia/cuda:12.6.3-devel-ubuntu22.04
+    steps:
+      - name: Install build tools
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends cmake build-essential git
+
+      - name: Checkout repository
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8  # v6.0.1
+
+      - name: Verify CUDA Toolkit
+        run: nvcc --version
+
+      - name: Configure CUDA-enabled native writer
+        run: cmake -S scripts/sdf_visualizer -B build/sdf-visualizer-cuda -DCMAKE_BUILD_TYPE=Release -DNEWTON_SDF_VTK_WRITER_ENABLE_CUDA=ON
+
+      - name: Build CUDA-enabled native writer
+        run: cmake --build build/sdf-visualizer-cuda --parallel
+
+      - name: Run native and CUDA writer tests
+        run: ctest --test-dir build/sdf-visualizer-cuda --output-on-failure

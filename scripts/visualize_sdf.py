@@ -39,7 +39,7 @@ import numpy as np
 import warp as wp
 
 import newton
-from newton._src.geometry.sdf_texture import TextureSDFData, texture_sample_sdf
+from newton._src.geometry.sdf_texture import TextureSDFData, _combine_dual_sdf_values, texture_sample_sdf
 
 
 @wp.kernel
@@ -98,7 +98,7 @@ def _sample_texture_sdf_dual_grid_kernel(
     values_b[tid] = distance_b
     # Negative-inside intersection: max(A, B). Compose only after each
     # field has independently performed its texture interpolation.
-    values_combined[tid] = distance_a if distance_a >= distance_b else distance_b
+    values_combined[tid] = _combine_dual_sdf_values(distance_a, distance_b)
 
 
 @wp.kernel

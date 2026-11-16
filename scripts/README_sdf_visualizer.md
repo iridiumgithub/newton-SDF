@@ -62,14 +62,14 @@ python scripts/visualize_sdf.py \
 
 ### 双场 SDF 可视化
 
-传入第二个 STL 可分别构建 A、B 两个 Newton texture-SDF，并在同一规则网格上独立插值后再做交集组合：
+传入第二个 STL 可分别构建 A、B 两个 Newton texture-SDF，并在两个纹理有效 AABB 的重叠区域内独立插值后再做交集组合。若两个有效区域没有重叠，程序会停止并提示增大 `--margin`（必要时同时调整 `--narrow-band`），而不是使用纹理域外的外推值生成误导性的 Combined 场：
 
 ```bash
-uv run python scripts/visualize_sdf.py \\
-  --input cases/boundary_a.stl \\
-  --input-b cases/boundary_b.stl \\
-  --output outputs/dual_field \\
-  --input-unit mm \\
+uv run python scripts/visualize_sdf.py \
+  --input cases/boundary_a.stl \
+  --input-b cases/boundary_b.stl \
+  --output outputs/dual_field \
+  --input-unit mm \
   --target-voxel-size 0.0005
 ```
 

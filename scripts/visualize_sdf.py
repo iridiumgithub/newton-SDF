@@ -722,6 +722,7 @@ def _export_dual_sdf_diagnostics(
     sample_info: dict[str, Any] = {
         "composition": "max(field_a, field_b)",
         "inside_convention": "negative",
+        "distance_metric": "CSG max composition; the sign and zero set are meaningful, but the result is not guaranteed to be an exact Euclidean SDF near non-smooth intersections",
         "sdf_bounds_min_m": lower.tolist(),
         "sdf_bounds_max_m": upper.tolist(),
         "sdf_bounds_extent_m": extents.tolist(),
@@ -1163,6 +1164,10 @@ def main(argv: list[str] | None = None) -> int:
             "enabled": sdf_b is not None,
             "composition": "max(field_a, field_b)" if sdf_b is not None else None,
             "inside_convention": "negative",
+            "distance_metric": (
+                "CSG max composition; not guaranteed to be an exact Euclidean SDF near non-smooth intersections"
+                if sdf_b is not None else None
+            ),
             "coordinate_frame": "shared world frame; no registration is applied",
         },
         "build": {
@@ -1202,7 +1207,7 @@ def main(argv: list[str] | None = None) -> int:
             "The Newton zero isosurface is extracted by Newton's texture-SDF Marching Cubes path.",
             "STL has no physical-unit metadata; input coordinates were scaled according to input_unit.",
             (
-                "Dual-field mode independently interpolates A and B, then composes max(A, B); use Contour(0) on sdf_combined.vti for the combined zero surface."
+                "Dual-field mode independently interpolates A and B, then composes max(A, B); the combined sign and zero set are meaningful, but distance magnitudes are not guaranteed to be exact Euclidean distances near non-smooth intersections. Use Contour(0) on sdf_combined.vti for the combined zero surface."
                 if sdf_b is not None
                 else "Single-field mode exports the Newton texture SDF."
             ),

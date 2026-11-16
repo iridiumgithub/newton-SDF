@@ -77,7 +77,7 @@ uv run python scripts/visualize_sdf.py \
 
 `d_combined(x) = max(d_A(x), d_B(x))`
 
-关键点是先分别插值 `d_A` 和 `d_B`，再取最大值；不要先在纹理顶点处做 max 再插值，否则同一个网格单元内的两个零交叉可能被抹掉。
+关键点是先分别插值 `d_A` 和 `d_B`，再取最大值；不要先在纹理顶点处做 max 再插值，否则同一个网格单元内的两个零交叉可能被抹掉。max 组合保留了交集的符号与零等值面，但在非光滑交线附近不保证仍是精确的欧氏距离场。
 
 双场模式输出 `sdf_field_a.vti`、`sdf_field_b.vti`、`sdf_combined.vti`，以及三个中心切片对应的 A/B/Combined 文件。Newton 分别提取 A、B 的零等值面；Combined 零面可在 ParaView 中对 `sdf_combined.vti` 使用 Contour，等值设为 0。具体采样边界、组合方式和各场统计写入 `metadata.json`。
 

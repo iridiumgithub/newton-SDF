@@ -44,6 +44,27 @@ NSV_API int nsv_write_vti(
     char* error_buffer,
     std::size_t error_capacity);
 
+// Returns 1 when this library was built with CUDA Runtime support, otherwise 0.
+NSV_API int nsv_has_cuda_support(void);
+
+// Write a contiguous float32 Warp/CUDA device array directly to VTI.
+// cuda_stream is the active Warp CUDA stream (0 means the default stream).
+// The function performs chunked asynchronous D2H copies into pinned host buffers.
+NSV_API int nsv_write_vti_cuda(
+    const char* path_utf8,
+    std::uint32_t nx,
+    std::uint32_t ny,
+    std::uint32_t nz,
+    const double origin_xyz[3],
+    const double spacing_xyz[3],
+    const void* device_values,
+    std::uint64_t value_count,
+    std::int32_t device_ordinal,
+    void* cuda_stream,
+    const char* array_name_utf8,
+    char* error_buffer,
+    std::size_t error_capacity);
+
 NSV_API int nsv_write_vtm(
     const char* path_utf8,
     const char* const* dataset_names_utf8,

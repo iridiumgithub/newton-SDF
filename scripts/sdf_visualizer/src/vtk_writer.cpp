@@ -5,10 +5,12 @@
 
 #include <array>
 #include <cstdint>
+#include <cmath>
 #include <cstring>
 #include <filesystem>
 #include <functional>
 #include <fstream>
+#include <iomanip>
 #include <limits>
 #include <sstream>
 #include <stdexcept>
@@ -196,6 +198,9 @@ void write_vtp_impl(
     const std::uint64_t connectivity_bytes =
         checked_multiply(connectivity_values, sizeof(std::int64_t), "connectivity bytes");
     const std::uint64_t offsets_bytes = checked_multiply(triangle_count, sizeof(std::int64_t), "offset bytes");
+    if (connectivity_values > static_cast<std::uint64_t>(std::numeric_limits<std::int64_t>::max())) {
+        throw std::overflow_error("VTP polygon offsets exceed the Int64 VTK limit.");
+    }
 
     const std::uint64_t points_offset = 0;
     const std::uint64_t connectivity_offset = checked_add(sizeof(std::uint64_t), point_bytes, "connectivity offset");
@@ -269,8 +274,11 @@ void write_vti_impl(
         throw std::invalid_argument("VTI origin and spacing pointers must not be null.");
     }
     for (int axis = 0; axis < 3; ++axis) {
-        if (!(spacing[axis] > 0.0)) {
-            throw std::invalid_argument("VTI spacing must be positive on every axis.");
+        if (!std::isfinite(origin[axis])) {
+            throw std::invalid_argument("VTI origin must contain only finite values.");
+        }
+        if (!std::isfinite(spacing[axis]) || !(spacing[axis] > 0.0)) {
+            throw std::invalid_argument("VTI spacing must be finite and positive on every axis.");
         }
     }
 
@@ -280,6 +288,7 @@ void write_vti_impl(
     extent << "0 " << (nx - 1) << " 0 " << (ny - 1) << " 0 " << (nz - 1);
 
     write_atomic(path, [&](std::ofstream& stream) {
+        stream << std::setprecision(17);
         write_xml_prefix(stream, "ImageData");
         stream << "  <ImageData WholeExtent=\"" << extent.str() << "\" Origin=\""
                << origin[0] << " " << origin[1] << " " << origin[2] << "\" Spacing=\""

@@ -3,6 +3,7 @@
 
 #include "newton_sdf_vtk_writer.h"
 
+#include <algorithm>
 #include <array>
 #include <cstdint>
 #include <cmath>
@@ -16,6 +17,10 @@
 #include <stdexcept>
 #include <string>
 #include <type_traits>
+
+#if defined(NSV_WITH_CUDA)
+#  include <cuda_runtime_api.h>
+#endif
 
 namespace {
 
@@ -308,6 +313,196 @@ void write_vti_impl(
     });
 }
 
+#if defined(NSV_WITH_CUDA)
+
+void check_cuda(cudaError_t result, const char* operation) {
+    if (result != cudaSuccess) {
+        throw std::runtime_error(
+            std::string(operation) + " failed: " + cudaGetErrorString(result));
+    }
+}
+
+class CudaDeviceGuard {
+public:
+    explicit CudaDeviceGuard(int device_ordinal) {
+        check_cuda(cudaGetDevice(&previous_device_), "cudaGetDevice");
+        check_cuda(cudaSetDevice(device_ordinal), "cudaSetDevice");
+        active_ = true;
+    }
+
+    ~CudaDeviceGuard() {
+        if (active_) {
+            cudaSetDevice(previous_device_);
+        }
+    }
+
+    CudaDeviceGuard(const CudaDeviceGuard&) = delete;
+    CudaDeviceGuard& operator=(const CudaDeviceGuard&) = delete;
+
+private:
+    int previous_device_ = 0;
+    bool active_ = false;
+};
+
+class PinnedBuffers {
+public:
+    PinnedBuffers(std::size_t capacity, cudaStream_t stream) : stream_(stream) {
+        check_cuda(cudaHostAlloc(&buffers_[0], capacity, cudaHostAllocPortable), "cudaHostAlloc(buffer 0)");
+        try {
+            check_cuda(cudaHostAlloc(&buffers_[1], capacity, cudaHostAllocPortable), "cudaHostAlloc(buffer 1)");
+        } catch (...) {
+            cudaFreeHost(buffers_[0]);
+            buffers_[0] = nullptr;
+            throw;
+        }
+    }
+
+    ~PinnedBuffers() {
+        // An exception may leave the second copy in flight; never free its
+        // destination until the Warp stream has finished using it.
+        if (stream_ != nullptr) {
+            cudaStreamSynchronize(stream_);
+        }
+        for (void*& buffer : buffers_) {
+            if (buffer != nullptr) {
+                cudaFreeHost(buffer);
+                buffer = nullptr;
+            }
+        }
+    }
+
+    void* operator[](std::size_t index) const { return buffers_[index]; }
+
+    PinnedBuffers(const PinnedBuffers&) = delete;
+    PinnedBuffers& operator=(const PinnedBuffers&) = delete;
+
+private:
+    void* buffers_[2]{nullptr, nullptr};
+    cudaStream_t stream_ = nullptr;
+};
+
+void write_vti_cuda_impl(
+    const std::filesystem::path& path,
+    std::uint32_t nx,
+    std::uint32_t ny,
+    std::uint32_t nz,
+    const double* origin,
+    const double* spacing,
+    const void* device_values,
+    std::uint64_t value_count,
+    int device_ordinal,
+    void* stream_handle,
+    const char* array_name) {
+    const std::uint64_t expected = checked_multiply(
+        checked_multiply(nx, ny, "VTI dimensions"), nz, "VTI dimensions");
+    if (expected != value_count) {
+        std::ostringstream message;
+        message << "VTI value count mismatch: expected " << expected << ", received " << value_count << ".";
+        throw std::invalid_argument(message.str());
+    }
+    if (nx == 0 || ny == 0 || nz == 0) {
+        throw std::invalid_argument("VTI dimensions must be non-zero.");
+    }
+    if (origin == nullptr || spacing == nullptr) {
+        throw std::invalid_argument("VTI origin and spacing pointers must not be null.");
+    }
+    if (device_values == nullptr) {
+        throw std::invalid_argument("CUDA VTI device pointer must not be null.");
+    }
+    for (int axis = 0; axis < 3; ++axis) {
+        if (!std::isfinite(origin[axis])) {
+            throw std::invalid_argument("VTI origin must contain only finite values.");
+        }
+        if (!std::isfinite(spacing[axis]) || !(spacing[axis] > 0.0)) {
+            throw std::invalid_argument("VTI spacing must be finite and positive on every axis.");
+        }
+    }
+
+    const std::uint64_t value_bytes = checked_multiply(value_count, sizeof(float), "VTI value bytes");
+    const std::string escaped_name = escape_xml(array_name == nullptr ? "scalars" : array_name);
+    std::ostringstream extent;
+    extent << "0 " << (nx - 1) << " 0 " << (ny - 1) << " 0 " << (nz - 1);
+
+    CudaDeviceGuard device_guard(device_ordinal);
+    const auto cuda_stream = reinterpret_cast<cudaStream_t>(stream_handle);
+    cudaStreamCaptureStatus capture_status = cudaStreamCaptureStatusNone;
+    check_cuda(cudaStreamIsCapturing(cuda_stream, &capture_status), "cudaStreamIsCapturing");
+    if (capture_status != cudaStreamCaptureStatusNone) {
+        throw std::runtime_error("Native VTI file export cannot run while the Warp CUDA stream is being captured.");
+    }
+
+    constexpr std::uint64_t kChunkBytes = 64ULL * 1024ULL * 1024ULL;
+    const auto buffer_capacity = static_cast<std::size_t>(
+        std::min<std::uint64_t>(value_bytes, kChunkBytes));
+    PinnedBuffers pinned_buffers(buffer_capacity, cuda_stream);
+    const auto* source = static_cast<const char*>(device_values);
+
+    write_atomic(path, [&](std::ofstream& file) {
+        file << std::setprecision(17);
+        write_xml_prefix(file, "ImageData");
+        file << "  <ImageData WholeExtent=\"" << extent.str() << "\" Origin=\""
+             << origin[0] << " " << origin[1] << " " << origin[2] << "\" Spacing=\""
+             << spacing[0] << " " << spacing[1] << " " << spacing[2] << "\">\n"
+             << "    <Piece Extent=\"" << extent.str() << "\">\n"
+             << "      <PointData Scalars=\"" << escaped_name << "\">\n"
+             << "        <DataArray type=\"Float32\" Name=\"" << escaped_name
+             << "\" NumberOfComponents=\"1\" format=\"appended\" offset=\"0\"/>\n"
+             << "      </PointData>\n"
+             << "      <CellData/>\n"
+             << "    </Piece>\n"
+             << "  </ImageData>\n"
+             << "  <AppendedData encoding=\"raw\">_";
+        write_block_header(file, value_bytes);
+
+        std::uint64_t offset = 0;
+        std::uint64_t current_bytes = std::min<std::uint64_t>(value_bytes, buffer_capacity);
+        std::size_t current_buffer = 0;
+        check_cuda(
+            cudaMemcpyAsync(
+                pinned_buffers[current_buffer],
+                source,
+                static_cast<std::size_t>(current_bytes),
+                cudaMemcpyDeviceToHost,
+                cuda_stream),
+            "cudaMemcpyAsync(first VTI chunk)");
+        check_cuda(cudaStreamSynchronize(cuda_stream), "cudaStreamSynchronize(first VTI chunk)");
+
+        while (offset < value_bytes) {
+            const std::uint64_t next_offset = offset + current_bytes;
+            const bool has_next = next_offset < value_bytes;
+            const std::size_t next_buffer = 1 - current_buffer;
+            std::uint64_t next_bytes = 0;
+
+            if (has_next) {
+                next_bytes = std::min<std::uint64_t>(value_bytes - next_offset, buffer_capacity);
+                check_cuda(
+                    cudaMemcpyAsync(
+                        pinned_buffers[next_buffer],
+                        source + next_offset,
+                        static_cast<std::size_t>(next_bytes),
+                        cudaMemcpyDeviceToHost,
+                        cuda_stream),
+                    "cudaMemcpyAsync(next VTI chunk)");
+            }
+
+            // The next D2H transfer overlaps with writing the previous pinned
+            // buffer to disk. Only two bounded pinned buffers are retained.
+            write_bytes(file, pinned_buffers[current_buffer], current_bytes);
+            offset = next_offset;
+
+            if (has_next) {
+                check_cuda(cudaStreamSynchronize(cuda_stream), "cudaStreamSynchronize(next VTI chunk)");
+                current_buffer = next_buffer;
+                current_bytes = next_bytes;
+            }
+        }
+
+        write_appended_suffix(file);
+    });
+}
+
+#endif  // NSV_WITH_CUDA
+
 void write_vtm_impl(
     const std::filesystem::path& path,
     const char* const* names,
@@ -347,6 +542,61 @@ int invoke(char* error_buffer, std::size_t error_capacity, Function&& function) 
 }
 
 }  // namespace
+
+int nsv_has_cuda_support(void) {
+#if defined(NSV_WITH_CUDA)
+    return 1;
+#else
+    return 0;
+#endif
+}
+
+int nsv_write_vti_cuda(
+    const char* path_utf8,
+    std::uint32_t nx,
+    std::uint32_t ny,
+    std::uint32_t nz,
+    const double origin_xyz[3],
+    const double spacing_xyz[3],
+    const void* device_values,
+    std::uint64_t value_count,
+    std::int32_t device_ordinal,
+    void* cuda_stream,
+    const char* array_name_utf8,
+    char* error_buffer,
+    std::size_t error_capacity) {
+#if defined(NSV_WITH_CUDA)
+    return invoke(error_buffer, error_capacity, [&]() {
+        write_vti_cuda_impl(
+            make_path(path_utf8),
+            nx,
+            ny,
+            nz,
+            origin_xyz,
+            spacing_xyz,
+            device_values,
+            value_count,
+            device_ordinal,
+            cuda_stream,
+            array_name_utf8);
+    });
+#else
+    (void)path_utf8;
+    (void)nx;
+    (void)ny;
+    (void)nz;
+    (void)origin_xyz;
+    (void)spacing_xyz;
+    (void)device_values;
+    (void)value_count;
+    (void)device_ordinal;
+    (void)cuda_stream;
+    (void)array_name_utf8;
+    return invoke(error_buffer, error_capacity, []() {
+        throw std::runtime_error("This native VTK writer was built without CUDA Runtime support.");
+    });
+#endif
+}
 
 int nsv_write_vtp(
     const char* path_utf8,

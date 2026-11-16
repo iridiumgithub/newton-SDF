@@ -301,7 +301,7 @@ class NativeVtkWriter:
         """Write a contiguous Warp float32 device array without calling array.numpy()."""
         if not self.cuda_enabled:
             return False
-        if not device.is_cuda or values.device != device:
+        if not device.is_cuda or not values.device.is_cuda or values.device.ordinal != device.ordinal:
             raise ValueError("CUDA VTI export requires a Warp array on the selected CUDA device.")
         if values.dtype != wp.float32 or not values.is_contiguous or values.ndim != 1:
             raise ValueError("CUDA VTI export requires a contiguous one-dimensional Warp float32 array.")
@@ -1044,8 +1044,11 @@ def main(argv: list[str] | None = None) -> int:
     if sdf_b is not None and (sdf_b.is_empty() or sdf_b.to_texture_kernel_data() is None):
         raise RuntimeError("SDF B construction produced an empty texture SDF.")
 
-    if writer.cuda_enabled:
+    cuda_device_export = writer.cuda_enabled and device.is_primary
+    if cuda_device_export:
         print("Native VTI export: direct Warp device pointer + chunked pinned-memory D2H")
+    elif writer.cuda_enabled:
+        print("WARNING: Warp is using a non-primary CUDA context; VTI export will use the host-copy fallback.")
     else:
         print("WARNING: native library has no CUDA Runtime support; VTI export will use Warp's host-copy fallback.")
 
@@ -1145,7 +1148,7 @@ def main(argv: list[str] | None = None) -> int:
             "backend": "native C++17",
             "library": str(writer.library_path),
             "vtk_binary_encoding": "raw appended binary",
-            "cuda_device_pointer_export": writer.cuda_enabled,
+            "cuda_device_pointer_export": cuda_device_export,
         },
         "input": mesh_info,
         "input_b": mesh_b_info,

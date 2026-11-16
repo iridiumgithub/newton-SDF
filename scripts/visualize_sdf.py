@@ -19,13 +19,12 @@ STL files do not encode physical units. The default input unit is metres; pass
 from __future__ import annotations
 
 import argparse
-import base64
+import ctypes
 import json
 import math
-import struct
+import os
 import sys
 import time
-import xml.etree.ElementTree as ET
 from pathlib import Path
 from typing import Any
 
@@ -74,66 +73,175 @@ def _vec3_to_numpy(value: Any) -> np.ndarray:
     return np.asarray([float(value[i]) for i in range(3)], dtype=np.float64)
 
 
-def _vtk_binary(values: np.ndarray, dtype: str) -> str:
-    """Encode one VTK XML inline-binary DataArray with a UInt64 byte-count header."""
-    array = np.ascontiguousarray(values, dtype=np.dtype(dtype))
-    payload = struct.pack("<Q", array.nbytes) + array.tobytes(order="C")
-    return base64.b64encode(payload).decode("ascii")
+class NativeVtkWriter:
+    """Thin ctypes binding to the C++17 VTK XML writer shipped with this tool."""
+
+    def __init__(self, library_path: Path | None = None):
+        script_dir = Path(__file__).resolve().parent
+        build_dir = script_dir / "sdf_visualizer" / "build"
+        library_names = (
+            ("newton_sdf_vtk_writer.dll", "libnewton_sdf_vtk_writer.dll")
+            if sys.platform == "win32"
+            else ("libnewton_sdf_vtk_writer.dylib",)
+            if sys.platform == "darwin"
+            else ("libnewton_sdf_vtk_writer.so",)
+        )
+
+        env_library = os.environ.get("NEWTON_SDF_VTK_WRITER_LIBRARY")
+        if library_path is not None:
+            candidates = [library_path.expanduser().resolve()]
+        elif env_library:
+            candidates = [Path(env_library).expanduser().resolve()]
+        else:
+            candidates = [
+                candidate
+                for name in library_names
+                for candidate in (
+                    build_dir / name,
+                    build_dir / "Release" / name,
+                    build_dir / "Debug" / name,
+                )
+            ]
+
+        resolved = next((candidate for candidate in candidates if candidate.is_file()), None)
+        if resolved is None:
+            expected = "\n".join(f"  - {candidate}" for candidate in candidates)
+            raise RuntimeError(
+                "Native C++ VTK writer was not found. Build it first:\n"
+                "  cmake -S scripts/sdf_visualizer -B scripts/sdf_visualizer/build "
+                "-DCMAKE_BUILD_TYPE=Release\n"
+                "  cmake --build scripts/sdf_visualizer/build --config Release --parallel\n"
+                f"Looked for:\n{expected}\n"
+                "Alternatively set NEWTON_SDF_VTK_WRITER_LIBRARY to the compiled library path."
+            )
+
+        try:
+            self._library = ctypes.CDLL(str(resolved))
+        except OSError as exc:
+            raise RuntimeError(f"Cannot load native VTK writer library {resolved}: {exc}") from exc
+        self.library_path = resolved
+
+        error_pointer = ctypes.POINTER(ctypes.c_char)
+        self._library.nsv_write_vtp.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_void_p,
+            ctypes.c_uint64,
+            ctypes.c_void_p,
+            ctypes.c_uint64,
+            error_pointer,
+            ctypes.c_size_t,
+        ]
+        self._library.nsv_write_vtp.restype = ctypes.c_int
+
+        self._library.nsv_write_vti.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.c_void_p,
+            ctypes.c_uint64,
+            ctypes.c_char_p,
+            error_pointer,
+            ctypes.c_size_t,
+        ]
+        self._library.nsv_write_vti.restype = ctypes.c_int
+
+        self._library.nsv_write_vtm.argtypes = [
+            ctypes.c_char_p,
+            ctypes.POINTER(ctypes.c_char_p),
+            ctypes.POINTER(ctypes.c_char_p),
+            ctypes.c_uint64,
+            error_pointer,
+            ctypes.c_size_t,
+        ]
+        self._library.nsv_write_vtm.restype = ctypes.c_int
+
+    @staticmethod
+    def _path_bytes(path: Path) -> bytes:
+        return str(path.expanduser().resolve()).encode("utf-8")
+
+    @staticmethod
+    def _check(result: int, error: ctypes.Array) -> None:
+        if result != 0:
+            message = error.value.decode("utf-8", errors="replace")
+            raise RuntimeError(f"Native VTK writer failed: {message or 'unknown C++ error'}")
+
+    def write_vtp(self, path: Path, points: np.ndarray, faces: np.ndarray) -> None:
+        # 仅在必要时整理为 C 连续、小端数组；C++ 直接写入这些缓冲区。
+        points_array = np.ascontiguousarray(points, dtype=np.dtype("<f4")).reshape(-1, 3)
+        faces_array = np.ascontiguousarray(faces, dtype=np.dtype("<i8")).reshape(-1, 3)
+        error = ctypes.create_string_buffer(2048)
+        result = self._library.nsv_write_vtp(
+            self._path_bytes(path),
+            points_array.ctypes.data_as(ctypes.c_void_p),
+            len(points_array),
+            faces_array.ctypes.data_as(ctypes.c_void_p),
+            len(faces_array),
+            error,
+            len(error),
+        )
+        self._check(result, error)
+
+    def write_vti(
+        self,
+        path: Path,
+        dims: tuple[int, int, int],
+        origin: np.ndarray,
+        spacing: np.ndarray,
+        values: np.ndarray,
+        array_name: str = "signed_distance_m",
+    ) -> None:
+        nx, ny, nz = (int(value) for value in dims)
+        expected_count = nx * ny * nz
+        values_array = np.ascontiguousarray(values, dtype=np.dtype("<f4")).reshape(-1)
+        if values_array.size != expected_count:
+            raise ValueError(
+                f"VTI sample count mismatch: expected {expected_count}, got {values_array.size}."
+            )
+        origin_array = np.ascontiguousarray(origin, dtype=np.float64).reshape(3)
+        spacing_array = np.ascontiguousarray(spacing, dtype=np.float64).reshape(3)
+        error = ctypes.create_string_buffer(2048)
+        result = self._library.nsv_write_vti(
+            self._path_bytes(path),
+            nx,
+            ny,
+            nz,
+            origin_array.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+            spacing_array.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+            values_array.ctypes.data_as(ctypes.c_void_p),
+            values_array.size,
+            array_name.encode("utf-8"),
+            error,
+            len(error),
+        )
+        self._check(result, error)
+
+    def write_vtm(self, path: Path, datasets: list[tuple[str, Path]], output_dir: Path) -> None:
+        names = [name.encode("utf-8") for name, _ in datasets]
+        files = [dataset_path.relative_to(output_dir).as_posix().encode("utf-8") for _, dataset_path in datasets]
+        names_array = (ctypes.c_char_p * len(names))(*names)
+        files_array = (ctypes.c_char_p * len(files))(*files)
+        error = ctypes.create_string_buffer(2048)
+        result = self._library.nsv_write_vtm(
+            self._path_bytes(path),
+            names_array,
+            files_array,
+            len(datasets),
+            error,
+            len(error),
+        )
+        self._check(result, error)
 
 
-def _write_vtp(path: Path, points: np.ndarray, faces: np.ndarray) -> None:
-    """Write triangle PolyData without requiring VTK or PyVista."""
-    points = np.ascontiguousarray(points, dtype="<f4").reshape(-1, 3)
-    faces = np.ascontiguousarray(faces, dtype=np.int64).reshape(-1, 3)
-
-    root = ET.Element(
-        "VTKFile",
-        {"type": "PolyData", "version": "1.0", "byte_order": "LittleEndian", "header_type": "UInt64"},
-    )
-    poly_data = ET.SubElement(root, "PolyData")
-    piece = ET.SubElement(
-        poly_data,
-        "Piece",
-        {
-            "NumberOfPoints": str(len(points)),
-            "NumberOfVerts": "0",
-            "NumberOfLines": "0",
-            "NumberOfStrips": "0",
-            "NumberOfPolys": str(len(faces)),
-        },
-    )
-
-    ET.SubElement(piece, "PointData")
-    ET.SubElement(piece, "CellData")
-    points_element = ET.SubElement(piece, "Points")
-    points_array = ET.SubElement(
-        points_element,
-        "DataArray",
-        {"type": "Float32", "NumberOfComponents": "3", "format": "binary"},
-    )
-    points_array.text = _vtk_binary(points, "<f4")
-
-    ET.SubElement(piece, "Verts")
-    ET.SubElement(piece, "Lines")
-    ET.SubElement(piece, "Strips")
-    polys = ET.SubElement(piece, "Polys")
-    connectivity = ET.SubElement(
-        polys,
-        "DataArray",
-        {"type": "Int64", "Name": "connectivity", "format": "binary"},
-    )
-    connectivity.text = _vtk_binary(faces.reshape(-1), "<i8")
-    offsets = ET.SubElement(
-        polys,
-        "DataArray",
-        {"type": "Int64", "Name": "offsets", "format": "binary"},
-    )
-    offsets.text = _vtk_binary(np.arange(3, 3 * len(faces) + 1, 3, dtype=np.int64), "<i8")
-
-    ET.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
+def _write_vtp(writer: NativeVtkWriter, path: Path, points: np.ndarray, faces: np.ndarray) -> None:
+    """Write triangle PolyData through the native C++ raw-appended VTK writer."""
+    writer.write_vtp(path, points, faces)
 
 
 def _write_vti(
+    writer: NativeVtkWriter,
     path: Path,
     dims: tuple[int, int, int],
     origin: np.ndarray,
@@ -141,54 +249,18 @@ def _write_vti(
     values: np.ndarray,
     array_name: str = "signed_distance_m",
 ) -> None:
-    """Write a VTK ImageData file; x is the fastest-varying sample index."""
-    nx, ny, nz = (int(v) for v in dims)
-    expected_count = nx * ny * nz
-    values = np.asarray(values, dtype=np.float32).reshape(-1)
-    if len(values) != expected_count:
-        raise ValueError(f"VTI sample count mismatch: expected {expected_count}, got {len(values)}.")
-
-    extent = f"0 {nx - 1} 0 {ny - 1} 0 {nz - 1}"
-    origin_text = " ".join(f"{float(v):.17g}" for v in origin)
-    spacing_text = " ".join(f"{float(v):.17g}" for v in spacing)
-
-    root = ET.Element(
-        "VTKFile",
-        {"type": "ImageData", "version": "1.0", "byte_order": "LittleEndian", "header_type": "UInt64"},
-    )
-    image_data = ET.SubElement(
-        root,
-        "ImageData",
-        {"WholeExtent": extent, "Origin": origin_text, "Spacing": spacing_text},
-    )
-    piece = ET.SubElement(image_data, "Piece", {"Extent": extent})
-    point_data = ET.SubElement(piece, "PointData", {"Scalars": array_name})
-    data_array = ET.SubElement(
-        point_data,
-        "DataArray",
-        {"type": "Float32", "Name": array_name, "NumberOfComponents": "1", "format": "binary"},
-    )
-    data_array.text = _vtk_binary(values, "<f4")
-    ET.SubElement(piece, "CellData")
-
-    ET.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
+    """Write ImageData through the native C++ raw-appended VTK writer."""
+    writer.write_vti(path, dims, origin, spacing, values, array_name)
 
 
-def _write_vtm(path: Path, datasets: list[tuple[str, Path]], output_dir: Path) -> None:
-    """Write a ParaView multiblock index referencing the exported VTK datasets."""
-    root = ET.Element(
-        "VTKFile",
-        {"type": "vtkMultiBlockDataSet", "version": "1.0", "byte_order": "LittleEndian"},
-    )
-    multiblock = ET.SubElement(root, "vtkMultiBlockDataSet")
-    for index, (name, dataset_path) in enumerate(datasets):
-        relative_path = dataset_path.relative_to(output_dir).as_posix()
-        ET.SubElement(
-            multiblock,
-            "DataSet",
-            {"index": str(index), "name": name, "file": relative_path},
-        )
-    ET.ElementTree(root).write(path, encoding="utf-8", xml_declaration=True)
+def _write_vtm(
+    writer: NativeVtkWriter,
+    path: Path,
+    datasets: list[tuple[str, Path]],
+    output_dir: Path,
+) -> None:
+    """Write the ParaView multiblock index through the native C++ writer."""
+    writer.write_vtm(path, datasets, output_dir)
 
 
 def _grid_dims(extents: np.ndarray, max_resolution: int) -> tuple[int, int, int]:
@@ -332,6 +404,7 @@ def _load_stl(path: Path, unit: str) -> tuple[newton.Mesh, dict[str, Any]]:
 
 
 def _export_sdf_diagnostics(
+    writer: NativeVtkWriter,
     sdf: newton.SDF,
     output_dir: Path,
     device: wp.Device,
@@ -370,7 +443,7 @@ def _export_sdf_diagnostics(
         spacing = extents / (np.asarray(dims, dtype=np.float64) - 1.0)
         values = _sample_sdf_grid(sdf_data_array, lower, spacing, dims, device)
         path = output_dir / "sdf_volume.vti"
-        _write_vti(path, dims, lower, spacing, values)
+        _write_vti(writer, path, dims, lower, spacing, values)
         datasets.append(("Sampled SDF volume", path))
         sample_info["sampled_datasets"]["sdf_volume"] = {
             "file": path.name,
@@ -413,7 +486,7 @@ def _export_sdf_diagnostics(
 
             values = _sample_sdf_grid(sdf_data_array, origin, spacing, dims, device)
             path = slices_dir / f"sdf_slice_{suffix}.vti"
-            _write_vti(path, dims, origin, spacing, values)
+            _write_vti(writer, path, dims, origin, spacing, values)
             datasets.append((display_name, path))
             sample_info["sampled_datasets"][f"slice_{suffix}"] = {
                 "file": path.relative_to(output_dir).as_posix(),
@@ -436,6 +509,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     parser.add_argument("--input", "--case", dest="input", type=Path, required=True, help="Input STL case file.")
     parser.add_argument("--output", type=Path, required=True, help="Output directory.")
+    parser.add_argument(
+        "--native-writer",
+        type=Path,
+        default=None,
+        help="Path to the compiled C++ VTK writer library (or use NEWTON_SDF_VTK_WRITER_LIBRARY).",
+    )
     parser.add_argument(
         "--input-unit",
         choices=tuple(_UNIT_TO_METERS),
@@ -535,6 +614,10 @@ def main(argv: list[str] | None = None) -> int:
     if args.max_slice_points < 4:
         parser.error("--max-slice-points must be at least 4.")
 
+    # Fail before loading/building the SDF if the native exporter is unavailable.
+    writer = NativeVtkWriter(args.native_writer)
+    print(f"Native VTK writer: {writer.library_path}")
+
     if not wp.is_cuda_available():
         raise RuntimeError(
             "Newton texture SDF construction requires CUDA. No CUDA-capable Warp device was detected."
@@ -581,7 +664,7 @@ def main(argv: list[str] | None = None) -> int:
 
     datasets: list[tuple[str, Path]] = []
     source_path = output_dir / "source_mesh.vtp"
-    _write_vtp(source_path, mesh.vertices, mesh.indices.reshape(-1, 3))
+    _write_vtp(writer, source_path, mesh.vertices, mesh.indices.reshape(-1, 3))
     datasets.append(("Source STL mesh", source_path))
     print(f"[3/5] Exported source mesh: {source_path}")
 
@@ -596,7 +679,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         zero_path = output_dir / "newton_zero_isosurface.vtp"
         zero_faces = np.asarray(zero_mesh.indices, dtype=np.int64).reshape(-1, 3)
-        _write_vtp(zero_path, zero_mesh.vertices, zero_faces)
+        _write_vtp(writer, zero_path, zero_mesh.vertices, zero_faces)
         datasets.append(("Newton extracted zero isosurface", zero_path))
         zero_mesh_info = {
             "extracted": True,
@@ -612,6 +695,7 @@ def main(argv: list[str] | None = None) -> int:
     print("[5/5] Sampling the actual interpolated texture SDF ...")
     sampling_start = time.perf_counter()
     sample_datasets, sample_info = _export_sdf_diagnostics(
+        writer,
         sdf,
         output_dir,
         device,
@@ -626,7 +710,7 @@ def main(argv: list[str] | None = None) -> int:
     sampling_seconds = time.perf_counter() - sampling_start
 
     multiblock_path = output_dir / "case.vtm"
-    _write_vtm(multiblock_path, datasets, output_dir)
+    _write_vtm(writer, multiblock_path, datasets, output_dir)
 
     texture_data = sdf.to_texture_kernel_data()
     coarse_texture = sdf._coarse_texture
@@ -668,6 +752,11 @@ def main(argv: list[str] | None = None) -> int:
 
     metadata = {
         "tool": "Newton SDF Inspector",
+        "visualization_writer": {
+            "backend": "native C++17",
+            "library": str(writer.library_path),
+            "vtk_binary_encoding": "raw appended binary",
+        },
         "input": mesh_info,
         "build": {
             "device": str(device),
@@ -694,7 +783,8 @@ def main(argv: list[str] | None = None) -> int:
         },
         "outputs": [path.relative_to(output_dir).as_posix() for _, path in datasets] + ["case.vtm"],
         "notes": [
-            "The VTI values are sampled from Newton's interpolated texture SDF.",
+            "The VTI values are sampled from Newton's interpolated texture SDF using a Warp CUDA kernel.",
+            "VTK XML serialization is performed by the native C++17 writer using raw appended binary arrays (no Base64 encoding).",
             "The Newton zero isosurface is extracted by Newton's texture-SDF Marching Cubes path.",
             "STL has no physical-unit metadata; input coordinates were scaled according to input_unit.",
             "This diagnostic currently visualizes the existing single-field Newton SDF path; it does not yet visualize the experimental dual-field sampler.",
@@ -705,6 +795,8 @@ def main(argv: list[str] | None = None) -> int:
 
     readme_lines = [
         "Newton SDF Inspector output",
+        "",
+        "VTK files are serialized by the native C++17 writer. Scalar-field sampling runs on the CUDA device through Newton's Warp kernel.",
         "",
         "1. Open case.vtm in ParaView to load all exported datasets together.",
         "2. Toggle Source STL mesh and Newton extracted zero isosurface to compare geometry.",

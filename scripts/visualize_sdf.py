@@ -313,8 +313,12 @@ class NativeVtkWriter:
 
         origin_array = np.ascontiguousarray(origin, dtype=np.float64).reshape(3)
         spacing_array = np.ascontiguousarray(spacing, dtype=np.float64).reshape(3)
+        if not device.is_primary:
+            # CUDA Runtime stream interop requires Warp's primary CUDA context.
+            return False
         warp_stream = wp.get_stream(device)
-        stream_handle = int(warp_stream.cuda_stream or 0)
+        raw_stream = warp_stream.cuda_stream
+        stream_handle = int(raw_stream.value if isinstance(raw_stream, ctypes.c_void_p) else (raw_stream or 0))
         error = ctypes.create_string_buffer(2048)
         result = self._library.nsv_write_vti_cuda(
             self._path_bytes(path),
@@ -797,9 +801,9 @@ def _export_dual_sdf_diagnostics(
                 origin,
                 spacing,
                 (
-                    f"sdf_field_a_slice_{suffix}.vti",
-                    f"sdf_field_b_slice_{suffix}.vti",
-                    f"sdf_combined_slice_{suffix}.vti",
+                    f"slices/sdf_field_a_slice_{suffix}.vti",
+                    f"slices/sdf_field_b_slice_{suffix}.vti",
+                    f"slices/sdf_combined_slice_{suffix}.vti",
                 ),
                 (
                     f"SDF field A {suffix.upper()} slice",
@@ -986,10 +990,13 @@ def main(argv: list[str] | None = None) -> int:
         f"  Vertices: {mesh_info['vertex_count']}, triangles: {mesh_info['triangle_count']}, "
         f"watertight: {mesh_info['watertight']}"
     )
-    if not mesh_info["watertight"] and args.sign_method == "auto":
-        print("  WARNING: mesh is not watertight; auto mode will use winding-number signs. Inspect the exported slices.")
-    elif not mesh_info["watertight"] and args.sign_method == "parity":
-        print("  WARNING: mesh is not watertight; parity signs may be unreliable. Consider --sign-method normal.")
+    for field_label, field_info in (("A", mesh_info), ("B", mesh_b_info)):
+        if field_info is None:
+            continue
+        if not field_info["watertight"] and args.sign_method == "auto":
+            print(f"  WARNING: mesh {field_label} is not watertight; auto mode will use winding-number signs.")
+        elif not field_info["watertight"] and args.sign_method == "parity":
+            print(f"  WARNING: mesh {field_label} is not watertight; parity signs may be unreliable.")
 
     print(f"[2/5] Building Newton texture SDF on {device} ...")
     build_start = time.perf_counter()
@@ -1125,7 +1132,6 @@ def main(argv: list[str] | None = None) -> int:
     else:
         sample_info["texture_layout"] = sample_info.pop("texture_layout_a")
 
-
     metadata = {
         "tool": "Newton SDF Inspector",
         "visualization_writer": {
@@ -1152,6 +1158,11 @@ def main(argv: list[str] | None = None) -> int:
             "sign_method_resolved": (
                 "parity" if mesh_info["watertight"] else "winding"
             ) if args.sign_method == "auto" else args.sign_method,
+            "sign_method_resolved_b": (
+                ("parity" if mesh_b_info["watertight"] else "winding")
+                if args.sign_method == "auto" and mesh_b_info is not None
+                else args.sign_method if mesh_b_info is not None else None
+            ),
             "texture_format": args.texture_format,
             "paired_samples": not args.no_paired_samples,
             "build_seconds": build_seconds,
@@ -1222,7 +1233,7 @@ def main(argv: list[str] | None = None) -> int:
         "target voxel size to improve the actual SDF; increasing visualization sampling",
         "density alone does not add geometric information to the SDF.",
     ])
-    readme = "\\n".join(readme_lines) + "\\n"
+    readme = "\n".join(readme_lines) + "\n"
     (output_dir / "README.txt").write_text(readme, encoding="utf-8")
 
     print("")

@@ -22,7 +22,7 @@ target_include_directories(newton_sdf_vtk_writer
         $<INSTALL_INTERFACE:include>
 )
 target_compile_definitions(newton_sdf_vtk_writer PRIVATE NEWTON_SDF_VTK_WRITER_EXPORTS)
-if(CUDAToolkit_FOUND)
+if(NEWTON_SDF_VTK_WRITER_ENABLE_CUDA AND CUDAToolkit_FOUND)
     target_compile_definitions(newton_sdf_vtk_writer PRIVATE NSV_WITH_CUDA=1)
     target_link_libraries(newton_sdf_vtk_writer PRIVATE CUDA::cudart)
     message(STATUS "Native SDF VTK writer: CUDA device-pointer export enabled")
@@ -59,7 +59,7 @@ if(NEWTON_SDF_VTK_WRITER_BUILD_TESTS)
         COMMAND test_vtk_writer "${CMAKE_CURRENT_BINARY_DIR}/test-output"
     )
 
-    if(CUDAToolkit_FOUND)
+    if(NEWTON_SDF_VTK_WRITER_ENABLE_CUDA AND CUDAToolkit_FOUND)
         add_executable(test_vtk_writer_cuda tests/test_vtk_writer_cuda.cpp)
         target_compile_features(test_vtk_writer_cuda PRIVATE cxx_std_17)
         target_link_libraries(test_vtk_writer_cuda PRIVATE newton_sdf_vtk_writer CUDA::cudart)

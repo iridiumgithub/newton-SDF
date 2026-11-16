@@ -19,12 +19,12 @@ permissions:
 
 jobs:
   native-vtk-writer:
-    name: Native VTK writer (\${{ matrix.os }})
+    name: Native VTK writer (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
         os: [ubuntu-latest, windows-latest, macos-latest]
-    runs-on: \${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
     steps:
       - name: Checkout repository
         uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8  # v6.0.1

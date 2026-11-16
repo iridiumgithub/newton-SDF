@@ -36,6 +36,8 @@ ctest --test-dir scripts/sdf_visualizer/build -C Release --output-on-failure
 
 C++ 导出器直接从连续内存缓冲区写入 VTK XML 的 raw-appended binary 数据，不执行 Base64 编码，也不构造大型 Python XML/bytes 副本。写入采用临时文件后重命名，避免中断时留下半个最终文件。
 
+CMake 会自动查找 CUDA Toolkit。若找到 CUDA Runtime，动态库会额外启用设备指针接口：Python 只传递 Warp 数组的 `ptr`、设备 ordinal 和当前 `wp.get_stream(device).cuda_stream`；C++ 在同一 CUDA stream 上执行分块 `cudaMemcpyAsync`，使用双缓冲 pinned host memory，并在磁盘写入当前块时传输下一块。每个 pinned buffer 上限为 32 MiB。若构建环境没有 CUDA Toolkit，则保留 C++ host-buffer 写入路径，Python 会回退到 Warp 的 host copy。
+
 ### 计算与 I/O 的职责边界
 
 - SDF 构建继续调用 Newton 的现有 API。
@@ -57,6 +59,27 @@ python scripts/visualize_sdf.py \
 ```
 
 也可以使用 `--case` 作为 `--input` 的别名。
+
+### 双场 SDF 可视化
+
+传入第二个 STL 可分别构建 A、B 两个 Newton texture-SDF，并在同一规则网格上独立插值后再做交集组合：
+
+```bash
+uv run python scripts/visualize_sdf.py \\
+  --input cases/boundary_a.stl \\
+  --input-b cases/boundary_b.stl \\
+  --output outputs/dual_field \\
+  --input-unit mm \\
+  --target-voxel-size 0.0005
+```
+
+`--input-b` 与 `--input` 必须处于相同世界坐标系、使用相同单位和方向约定；工具不会自动配准两个网格。两个场均采用负值表示内部时，组合定义为：
+
+`d_combined(x) = max(d_A(x), d_B(x))`
+
+关键点是先分别插值 `d_A` 和 `d_B`，再取最大值；不要先在纹理顶点处做 max 再插值，否则同一个网格单元内的两个零交叉可能被抹掉。
+
+双场模式输出 `sdf_field_a.vti`、`sdf_field_b.vti`、`sdf_combined.vti`，以及三个中心切片对应的 A/B/Combined 文件。Newton 分别提取 A、B 的零等值面；Combined 零面可在 ParaView 中对 `sdf_combined.vti` 使用 Contour，等值设为 0。具体采样边界、组合方式和各场统计写入 `metadata.json`。
 
 STL 不包含物理单位信息。若 STL 坐标以毫米为单位，必须指定 `--input-unit mm`；工具会先将坐标转换为米，再交给 Newton 构建 SDF。
 
@@ -105,8 +128,9 @@ outputs/hollow_cylinder/
 
 - `source_mesh.vtp`：由 STL 读取的源三角网格。
 - `newton_zero_isosurface.vtp`：调用 Newton 的 `SDF.extract_isomesh(0)` 得到的零等值面。
-- `sdf_volume.vti`：在规则三维采样点上调用 Newton texture-SDF 插值函数得到的标量场。
-- `sdf_slice_*.vti`：AABB 中心处的 XY、XZ、YZ 三个剖面，用于检查薄壁和细长结构。
+- `sdf_volume.vti`：单场模式下，在规则三维采样点上调用 Newton texture-SDF 插值函数得到的标量场。
+- 双场模式额外生成 `sdf_field_a.vti`、`sdf_field_b.vti` 和 `sdf_combined.vti`，分别表示独立采样的 A、B 与 max(A, B)。
+- `sdf_slice_*.vti`：单场模式的 AABB 中心剖面；双场模式会为 A、B、Combined 分别输出 XY、XZ、YZ 剖面。
 - `case.vtm`：ParaView 多数据集入口，打开一次即可加载所有数据。
 - `metadata.json`：输入网格拓扑信息、单位、SDF 参数、纹理尺寸、采样尺寸、距离范围和耗时。
 

@@ -4,6 +4,7 @@
 #include "newton_sdf_vtk_writer.h"
 
 #include <cstdint>
+#include <cstdlib>
 #include <filesystem>
 #include <fstream>
 #include <iostream>

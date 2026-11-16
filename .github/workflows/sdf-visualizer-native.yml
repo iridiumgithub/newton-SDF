@@ -1,0 +1,47 @@
+name: SDF Visualizer Native
+
+on:
+  push:
+    branches:
+      - feature/dual-field-sdf
+    paths:
+      - "scripts/sdf_visualizer/**"
+      - "scripts/visualize_sdf.py"
+      - ".github/workflows/sdf-visualizer-native.yml"
+  pull_request:
+    paths:
+      - "scripts/sdf_visualizer/**"
+      - "scripts/visualize_sdf.py"
+      - ".github/workflows/sdf-visualizer-native.yml"
+
+permissions:
+  contents: read
+
+jobs:
+  native-vtk-writer:
+    name: Native VTK writer (\${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest, macos-latest]
+    runs-on: \${{ matrix.os }}
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8  # v6.0.1
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405  # v6.2.0
+        with:
+          python-version: "3.13"
+
+      - name: Check Python entry-point syntax
+        run: python -m py_compile scripts/visualize_sdf.py
+
+      - name: Configure native writer
+        run: cmake -S scripts/sdf_visualizer -B build/sdf-visualizer -DCMAKE_BUILD_TYPE=Release
+
+      - name: Build native writer
+        run: cmake --build build/sdf-visualizer --config Release --parallel
+
+      - name: Run native writer tests
+        run: ctest --test-dir build/sdf-visualizer --build-config Release --output-on-failure

@@ -319,12 +319,13 @@ class NativeVtkWriter:
 
         origin_array = np.ascontiguousarray(origin, dtype=np.float64).reshape(3)
         spacing_array = np.ascontiguousarray(spacing, dtype=np.float64).reshape(3)
-        if not device.is_primary:
+        if not device.is_primary or not values.device.is_primary:
             # CUDA Runtime stream interop requires Warp's primary CUDA context.
             return False
         warp_stream = wp.get_stream(device)
         raw_stream = warp_stream.cuda_stream
-        stream_handle = int(raw_stream.value if isinstance(raw_stream, ctypes.c_void_p) else (raw_stream or 0))
+        stream_value = raw_stream.value if isinstance(raw_stream, ctypes.c_void_p) else raw_stream
+        stream_handle = int(stream_value or 0)
         error = ctypes.create_string_buffer(2048)
         result = self._library.nsv_write_vti_cuda(
             self._path_bytes(path),

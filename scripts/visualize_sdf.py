@@ -172,26 +172,32 @@ class NativeVtkWriter:
         self.library_path = resolved
 
         error_pointer = ctypes.POINTER(ctypes.c_char)
-        self._library.nsv_has_cuda_support.argtypes = []
-        self._library.nsv_has_cuda_support.restype = ctypes.c_int
-        self.cuda_enabled = bool(self._library.nsv_has_cuda_support())
+        try:
+            self._library.nsv_has_cuda_support.argtypes = []
+            self._library.nsv_has_cuda_support.restype = ctypes.c_int
+            self.cuda_enabled = bool(self._library.nsv_has_cuda_support())
 
-        self._library.nsv_write_vti_cuda.argtypes = [
-            ctypes.c_char_p,
-            ctypes.c_uint32,
-            ctypes.c_uint32,
-            ctypes.c_uint32,
-            ctypes.POINTER(ctypes.c_double),
-            ctypes.POINTER(ctypes.c_double),
-            ctypes.c_void_p,
-            ctypes.c_uint64,
-            ctypes.c_int32,
-            ctypes.c_void_p,
-            ctypes.c_char_p,
-            error_pointer,
-            ctypes.c_size_t,
-        ]
-        self._library.nsv_write_vti_cuda.restype = ctypes.c_int
+            self._library.nsv_write_vti_cuda.argtypes = [
+                ctypes.c_char_p,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.c_uint32,
+                ctypes.POINTER(ctypes.c_double),
+                ctypes.POINTER(ctypes.c_double),
+                ctypes.c_void_p,
+                ctypes.c_uint64,
+                ctypes.c_int32,
+                ctypes.c_void_p,
+                ctypes.c_char_p,
+                error_pointer,
+                ctypes.c_size_t,
+            ]
+            self._library.nsv_write_vti_cuda.restype = ctypes.c_int
+        except AttributeError as exc:
+            raise RuntimeError(
+                f"Native VTK writer {resolved} is outdated. Rebuild scripts/sdf_visualizer "
+                "after updating the repository."
+            ) from exc
         self._library.nsv_write_vtp.argtypes = [
             ctypes.c_char_p,
             ctypes.c_void_p,

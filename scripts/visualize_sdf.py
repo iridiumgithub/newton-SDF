@@ -4,8 +4,14 @@
 """Build a texture SDF from an STL and export ParaView-ready diagnostics.
 
 Quick start:
+    cmake -S scripts/sdf_visualizer -B scripts/sdf_visualizer/build -DCMAKE_BUILD_TYPE=Release
+    cmake --build scripts/sdf_visualizer/build --parallel
     uv sync --extra importers
     python scripts/visualize_sdf.py --input cases/hollow_cylinder.stl --output outputs/hollow_cylinder
+
+VTK XML serialization is handled by the native C++17 writer. The SDF field is
+sampled on the CUDA device by Newton's Warp kernel before the data is passed
+to the writer as contiguous host buffers.
 
 Open outputs/hollow_cylinder/case.vtm in ParaView. The multiblock contains the
 source mesh, Newton's extracted zero isosurface, a sampled 3-D SDF volume, and
@@ -435,6 +441,7 @@ def _export_sdf_diagnostics(
         "subgrid_size": int(texture_data.subgrid_size),
         "num_subgrids": int(texture_data.num_subgrids),
         "paired_samples": bool(texture_data.paired_samples),
+        "sampling_backend": "Warp CUDA kernel calling Newton texture_sample_sdf",
         "sampled_datasets": {},
     }
 
@@ -505,7 +512,7 @@ def _export_sdf_diagnostics(
 
 def _build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
-        description="Build a Newton texture SDF from an STL and export ParaView diagnostics."
+        description="Build a Newton texture SDF from an STL and export ParaView diagnostics with the native C++ writer."
     )
     parser.add_argument("--input", "--case", dest="input", type=Path, required=True, help="Input STL case file.")
     parser.add_argument("--output", type=Path, required=True, help="Output directory.")

@@ -360,9 +360,7 @@ public:
     ~PinnedBuffers() {
         // An exception may leave the second copy in flight; never free its
         // destination until the Warp stream has finished using it.
-        if (stream_ != nullptr) {
-            cudaStreamSynchronize(stream_);
-        }
+        cudaStreamSynchronize(stream_);
         for (void*& buffer : buffers_) {
             if (buffer != nullptr) {
                 cudaFreeHost(buffer);
@@ -431,7 +429,7 @@ void write_vti_cuda_impl(
         throw std::runtime_error("Native VTI file export cannot run while the Warp CUDA stream is being captured.");
     }
 
-    constexpr std::uint64_t kChunkBytes = 64ULL * 1024ULL * 1024ULL;
+    constexpr std::uint64_t kChunkBytes = 32ULL * 1024ULL * 1024ULL;
     const auto buffer_capacity = static_cast<std::size_t>(
         std::min<std::uint64_t>(value_bytes, kChunkBytes));
     PinnedBuffers pinned_buffers(buffer_capacity, cuda_stream);

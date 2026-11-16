@@ -11,7 +11,8 @@ Quick start:
 
 VTK XML serialization is handled by the native C++17 writer. The SDF field is
 sampled on the CUDA device by Newton's Warp kernel before the data is passed
-to the writer as contiguous host buffers.
+to the writer as contiguous buffers. When the native library is built with the CUDA Toolkit,
+it receives the Warp device pointer and performs bounded, asynchronous D2H transfers.
 
 Open outputs/hollow_cylinder/case.vtm in ParaView. The multiblock contains the
 source mesh, Newton's extracted zero isosurface, a sampled 3-D SDF volume, and
@@ -65,6 +66,49 @@ def _sample_texture_sdf_grid_kernel(
         float(iz) * spacing[2],
     )
     values[tid] = texture_sample_sdf(sdf_data[0], position)
+
+
+@wp.kernel
+def _sample_texture_sdf_dual_grid_kernel(
+    sdf_a_data: wp.array(dtype=TextureSDFData),
+    sdf_b_data: wp.array(dtype=TextureSDFData),
+    origin: wp.vec3,
+    spacing: wp.vec3,
+    dims: wp.vec3i,
+    values_a: wp.array(dtype=wp.float32),
+    values_b: wp.array(dtype=wp.float32),
+    values_combined: wp.array(dtype=wp.float32),
+):
+    """Sample two fields independently, then compose their interpolated values."""
+    tid = wp.tid()
+    nx = dims[0]
+    ny = dims[1]
+    ix = tid % nx
+    iy = (tid // nx) % ny
+    iz = tid // (nx * ny)
+    position = origin + wp.vec3(
+        float(ix) * spacing[0],
+        float(iy) * spacing[1],
+        float(iz) * spacing[2],
+    )
+
+    distance_a = texture_sample_sdf(sdf_a_data[0], position)
+    distance_b = texture_sample_sdf(sdf_b_data[0], position)
+    values_a[tid] = distance_a
+    values_b[tid] = distance_b
+    # Negative-inside intersection: max(A, B). Compose only after each
+    # field has independently performed its texture interpolation.
+    values_combined[tid] = distance_a if distance_a >= distance_b else distance_b
+
+
+@wp.kernel
+def _reduce_sdf_stats_kernel(values: wp.array(dtype=wp.float32), stats: wp.array(dtype=wp.float32)):
+    """Reduce min, max, and negative-sample count to three device scalars."""
+    value = values[wp.tid()]
+    wp.atomic_min(stats, 0, value)
+    wp.atomic_max(stats, 1, value)
+    if value < 0.0:
+        wp.atomic_add(stats, 2, 1.0)
 
 
 _UNIT_TO_METERS = {
@@ -128,6 +172,26 @@ class NativeVtkWriter:
         self.library_path = resolved
 
         error_pointer = ctypes.POINTER(ctypes.c_char)
+        self._library.nsv_has_cuda_support.argtypes = []
+        self._library.nsv_has_cuda_support.restype = ctypes.c_int
+        self.cuda_enabled = bool(self._library.nsv_has_cuda_support())
+
+        self._library.nsv_write_vti_cuda.argtypes = [
+            ctypes.c_char_p,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.c_uint32,
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.POINTER(ctypes.c_double),
+            ctypes.c_void_p,
+            ctypes.c_uint64,
+            ctypes.c_int32,
+            ctypes.c_void_p,
+            ctypes.c_char_p,
+            error_pointer,
+            ctypes.c_size_t,
+        ]
+        self._library.nsv_write_vti_cuda.restype = ctypes.c_int
         self._library.nsv_write_vtp.argtypes = [
             ctypes.c_char_p,
             ctypes.c_void_p,
@@ -224,6 +288,52 @@ class NativeVtkWriter:
         )
         self._check(result, error)
 
+    def write_vti_cuda(
+        self,
+        path: Path,
+        dims: tuple[int, int, int],
+        origin: np.ndarray,
+        spacing: np.ndarray,
+        values: wp.array,
+        device: wp.Device,
+        array_name: str = "signed_distance_m",
+    ) -> bool:
+        """Write a contiguous Warp float32 device array without calling array.numpy()."""
+        if not self.cuda_enabled:
+            return False
+        if not device.is_cuda or values.device != device:
+            raise ValueError("CUDA VTI export requires a Warp array on the selected CUDA device.")
+        if values.dtype != wp.float32 or not values.is_contiguous or values.ndim != 1:
+            raise ValueError("CUDA VTI export requires a contiguous one-dimensional Warp float32 array.")
+
+        nx, ny, nz = (int(value) for value in dims)
+        expected_count = nx * ny * nz
+        if values.size != expected_count:
+            raise ValueError(f"VTI sample count mismatch: expected {expected_count}, got {values.size}.")
+
+        origin_array = np.ascontiguousarray(origin, dtype=np.float64).reshape(3)
+        spacing_array = np.ascontiguousarray(spacing, dtype=np.float64).reshape(3)
+        warp_stream = wp.get_stream(device)
+        stream_handle = int(warp_stream.cuda_stream or 0)
+        error = ctypes.create_string_buffer(2048)
+        result = self._library.nsv_write_vti_cuda(
+            self._path_bytes(path),
+            nx,
+            ny,
+            nz,
+            origin_array.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+            spacing_array.ctypes.data_as(ctypes.POINTER(ctypes.c_double)),
+            ctypes.c_void_p(int(values.ptr)),
+            values.size,
+            int(device.ordinal),
+            ctypes.c_void_p(stream_handle),
+            array_name.encode("utf-8"),
+            error,
+            len(error),
+        )
+        self._check(result, error)
+        return True
+
     def write_vtm(self, path: Path, datasets: list[tuple[str, Path]], output_dir: Path) -> None:
         names = [name.encode("utf-8") for name, _ in datasets]
         files = [dataset_path.relative_to(output_dir).as_posix().encode("utf-8") for _, dataset_path in datasets]
@@ -252,10 +362,16 @@ def _write_vti(
     dims: tuple[int, int, int],
     origin: np.ndarray,
     spacing: np.ndarray,
-    values: np.ndarray,
+    values: wp.array | np.ndarray,
+    device: wp.Device,
     array_name: str = "signed_distance_m",
 ) -> None:
-    """Write ImageData through the native C++ raw-appended VTK writer."""
+    """Write ImageData; use the Warp device pointer when CUDA Runtime support is available."""
+    if isinstance(values, wp.array):
+        if writer.write_vti_cuda(path, dims, origin, spacing, values, device, array_name):
+            return
+        # Compatibility fallback for native libraries built without the CUDA Toolkit.
+        values = values.numpy()
     writer.write_vti(path, dims, origin, spacing, values, array_name)
 
 
@@ -338,8 +454,8 @@ def _sample_sdf_grid(
     spacing: np.ndarray,
     dims: tuple[int, int, int],
     device: wp.Device,
-) -> np.ndarray:
-    """Sample the actual Newton texture SDF on a regular grid."""
+) -> wp.array:
+    """Sample the actual Newton texture SDF and retain the result on the GPU."""
     total = math.prod(dims)
     output = wp.empty(total, dtype=wp.float32, device=device)
     wp.launch(
@@ -354,7 +470,54 @@ def _sample_sdf_grid(
         outputs=[output],
         device=device,
     )
-    return output.numpy()
+    return output
+
+
+def _sample_dual_sdf_grid(
+    sdf_a_data: wp.array,
+    sdf_b_data: wp.array,
+    origin: np.ndarray,
+    spacing: np.ndarray,
+    dims: tuple[int, int, int],
+    device: wp.Device,
+) -> tuple[wp.array, wp.array, wp.array]:
+    """Sample A and B independently, then compute max(A, B), entirely on CUDA."""
+    total = math.prod(dims)
+    values_a = wp.empty(total, dtype=wp.float32, device=device)
+    values_b = wp.empty(total, dtype=wp.float32, device=device)
+    values_combined = wp.empty(total, dtype=wp.float32, device=device)
+    wp.launch(
+        _sample_texture_sdf_dual_grid_kernel,
+        dim=total,
+        inputs=[
+            sdf_a_data,
+            sdf_b_data,
+            wp.vec3(float(origin[0]), float(origin[1]), float(origin[2])),
+            wp.vec3(float(spacing[0]), float(spacing[1]), float(spacing[2])),
+            wp.vec3i(int(dims[0]), int(dims[1]), int(dims[2])),
+        ],
+        outputs=[values_a, values_b, values_combined],
+        device=device,
+    )
+    return values_a, values_b, values_combined
+
+
+def _sdf_grid_stats(values: wp.array, device: wp.Device) -> dict[str, float]:
+    """Copy only three reduced scalars to the CPU, never the full sample field."""
+    if values.size == 0:
+        raise ValueError("Cannot compute statistics for an empty SDF sample array.")
+    stats = wp.array(
+        np.asarray([np.inf, -np.inf, 0.0], dtype=np.float32),
+        dtype=wp.float32,
+        device=device,
+    )
+    wp.launch(_reduce_sdf_stats_kernel, dim=values.size, inputs=[values], outputs=[stats], device=device)
+    minimum, maximum, negative_count = (float(value) for value in stats.numpy())
+    return {
+        "minimum_m": minimum,
+        "maximum_m": maximum,
+        "negative_sample_fraction": negative_count / values.size,
+    }
 
 
 def _load_stl(path: Path, unit: str) -> tuple[newton.Mesh, dict[str, Any]]:
@@ -450,16 +613,14 @@ def _export_sdf_diagnostics(
         spacing = extents / (np.asarray(dims, dtype=np.float64) - 1.0)
         values = _sample_sdf_grid(sdf_data_array, lower, spacing, dims, device)
         path = output_dir / "sdf_volume.vti"
-        _write_vti(writer, path, dims, lower, spacing, values)
+        _write_vti(writer, path, dims, lower, spacing, values, device)
         datasets.append(("Sampled SDF volume", path))
         sample_info["sampled_datasets"]["sdf_volume"] = {
             "file": path.name,
             "dimensions": list(dims),
             "spacing_m": spacing.tolist(),
             "sample_count": int(values.size),
-            "minimum_m": float(np.min(values)),
-            "maximum_m": float(np.max(values)),
-            "negative_sample_fraction": float(np.mean(values < 0.0)),
+            **_sdf_grid_stats(values, device),
         }
         print(f"  Exported volume: {path} ({dims[0]} x {dims[1]} x {dims[2]})")
 
@@ -493,7 +654,7 @@ def _export_sdf_diagnostics(
 
             values = _sample_sdf_grid(sdf_data_array, origin, spacing, dims, device)
             path = slices_dir / f"sdf_slice_{suffix}.vti"
-            _write_vti(writer, path, dims, origin, spacing, values)
+            _write_vti(writer, path, dims, origin, spacing, values, device)
             datasets.append((display_name, path))
             sample_info["sampled_datasets"][f"slice_{suffix}"] = {
                 "file": path.relative_to(output_dir).as_posix(),
@@ -501,13 +662,183 @@ def _export_sdf_diagnostics(
                 "origin_m": origin.tolist(),
                 "spacing_m": spacing.tolist(),
                 "sample_count": int(values.size),
-                "minimum_m": float(np.min(values)),
-                "maximum_m": float(np.max(values)),
-                "negative_sample_fraction": float(np.mean(values < 0.0)),
+                **_sdf_grid_stats(values, device),
             }
             print(f"  Exported {suffix.upper()} slice: {path} ({nu} x {nv})")
 
     return datasets, sample_info
+
+
+def _export_dual_sdf_diagnostics(
+    writer: NativeVtkWriter,
+    sdf_a: newton.SDF,
+    sdf_b: newton.SDF,
+    output_dir: Path,
+    device: wp.Device,
+    volume_resolution: int,
+    slice_resolution: int,
+    max_volume_points: int,
+    max_slice_points: int,
+    export_volume: bool,
+    export_slices: bool,
+) -> tuple[list[tuple[str, Path]], dict[str, Any]]:
+    """Export A, B, and max(A, B) sampled after independent texture interpolation."""
+    texture_a = sdf_a.to_texture_kernel_data()
+    texture_b = sdf_b.to_texture_kernel_data()
+    if texture_a is None or texture_b is None:
+        raise RuntimeError("Both dual-field SDFs must contain texture data.")
+
+    lower_a = _vec3_to_numpy(texture_a.sdf_box_lower)
+    upper_a = _vec3_to_numpy(texture_a.sdf_box_upper)
+    lower_b = _vec3_to_numpy(texture_b.sdf_box_lower)
+    upper_b = _vec3_to_numpy(texture_b.sdf_box_upper)
+    lower = np.minimum(lower_a, lower_b)
+    upper = np.maximum(upper_a, upper_b)
+    extents = upper - lower
+    if np.any(extents <= 0.0):
+        raise RuntimeError(f"Invalid dual-field sampling bounds: lower={lower.tolist()}, upper={upper.tolist()}")
+
+    sdf_a_data = wp.array([texture_a], dtype=TextureSDFData, device=device)
+    sdf_b_data = wp.array([texture_b], dtype=TextureSDFData, device=device)
+    datasets: list[tuple[str, Path]] = []
+    sample_info: dict[str, Any] = {
+        "composition": "max(field_a, field_b)",
+        "inside_convention": "negative",
+        "sdf_bounds_min_m": lower.tolist(),
+        "sdf_bounds_max_m": upper.tolist(),
+        "sdf_bounds_extent_m": extents.tolist(),
+        "sampling_backend": "Warp CUDA kernel; interpolate A and B independently before max composition",
+        "fields": {
+            "a": {
+                "sdf_bounds_min_m": lower_a.tolist(),
+                "sdf_bounds_max_m": upper_a.tolist(),
+                "voxel_size_m": _vec3_to_numpy(texture_a.voxel_size).tolist(),
+                "subgrid_size": int(texture_a.subgrid_size),
+                "num_subgrids": int(texture_a.num_subgrids),
+                "paired_samples": bool(texture_a.paired_samples),
+            },
+            "b": {
+                "sdf_bounds_min_m": lower_b.tolist(),
+                "sdf_bounds_max_m": upper_b.tolist(),
+                "voxel_size_m": _vec3_to_numpy(texture_b.voxel_size).tolist(),
+                "subgrid_size": int(texture_b.subgrid_size),
+                "num_subgrids": int(texture_b.num_subgrids),
+                "paired_samples": bool(texture_b.paired_samples),
+            },
+        },
+        "sampled_datasets": {},
+    }
+
+    def export_triplet(
+        suffix: str,
+        dims: tuple[int, int, int],
+        origin: np.ndarray,
+        spacing: np.ndarray,
+        names: tuple[str, str, str],
+        labels: tuple[str, str, str],
+    ) -> None:
+        values_a, values_b, values_combined = _sample_dual_sdf_grid(
+            sdf_a_data, sdf_b_data, origin, spacing, dims, device
+        )
+        for field_key, display_name, file_name, values in (
+            ("field_a", labels[0], names[0], values_a),
+            ("field_b", labels[1], names[1], values_b),
+            ("combined", labels[2], names[2], values_combined),
+        ):
+            path = output_dir / file_name
+            _write_vti(writer, path, dims, origin, spacing, values, device)
+            datasets.append((display_name, path))
+            sample_info["sampled_datasets"][f"{field_key}_{suffix}"] = {
+                "file": path.relative_to(output_dir).as_posix(),
+                "dimensions": list(dims),
+                "origin_m": origin.tolist(),
+                "spacing_m": spacing.tolist(),
+                "sample_count": int(values.size),
+                **_sdf_grid_stats(values, device),
+            }
+            print(f"  Exported {display_name}: {path}")
+
+    if export_volume:
+        dims = _fit_volume_dims(extents, volume_resolution, max_volume_points)
+        spacing = extents / (np.asarray(dims, dtype=np.float64) - 1.0)
+        export_triplet(
+            "volume",
+            dims,
+            lower,
+            spacing,
+            ("sdf_field_a.vti", "sdf_field_b.vti", "sdf_combined.vti"),
+            ("SDF field A volume", "SDF field B volume", "Combined max(A, B) volume"),
+        )
+
+    if export_slices:
+        slices_dir = output_dir / "slices"
+        slices_dir.mkdir(parents=True, exist_ok=True)
+        center = 0.5 * (lower + upper)
+        slice_specs = (
+            ("xy", 0, 1, 2),
+            ("xz", 0, 2, 1),
+            ("yz", 1, 2, 0),
+        )
+        for suffix, axis_u, axis_v, fixed_axis in slice_specs:
+            nu, nv = _fit_slice_dims(extents, axis_u, axis_v, slice_resolution, max_slice_points)
+            dims_list = [1, 1, 1]
+            dims_list[axis_u] = nu
+            dims_list[axis_v] = nv
+            dims = tuple(dims_list)
+
+            origin = lower.copy()
+            origin[fixed_axis] = center[fixed_axis]
+            spacing = np.ones(3, dtype=np.float64)
+            spacing[axis_u] = extents[axis_u] / (nu - 1)
+            spacing[axis_v] = extents[axis_v] / (nv - 1)
+            export_triplet(
+                f"slice_{suffix}",
+                dims,
+                origin,
+                spacing,
+                (
+                    f"sdf_field_a_slice_{suffix}.vti",
+                    f"sdf_field_b_slice_{suffix}.vti",
+                    f"sdf_combined_slice_{suffix}.vti",
+                ),
+                (
+                    f"SDF field A {suffix.upper()} slice",
+                    f"SDF field B {suffix.upper()} slice",
+                    f"Combined max(A, B) {suffix.upper()} slice",
+                ),
+            )
+
+    return datasets, sample_info
+
+
+def _texture_layout_info(sdf: newton.SDF) -> dict[str, Any]:
+    texture_data = sdf.to_texture_kernel_data()
+    if texture_data is None:
+        raise RuntimeError("SDF has no texture data.")
+    coarse_texture = sdf._coarse_texture
+    subgrid_texture = sdf._subgrid_texture
+    coarse_dimensions = (
+        [int(coarse_texture.width), int(coarse_texture.height), int(coarse_texture.depth)]
+        if coarse_texture is not None
+        else None
+    )
+    coarse_cells = [dimension - 1 for dimension in coarse_dimensions] if coarse_dimensions is not None else None
+    subgrid_size = int(texture_data.subgrid_size)
+    fine_cells = [dimension * subgrid_size for dimension in coarse_cells] if coarse_cells is not None else None
+    return {
+        "coarse_texture_dimensions": coarse_dimensions,
+        "coarse_cell_dimensions": coarse_cells,
+        "fine_grid_cell_dimensions": fine_cells,
+        "fine_grid_sample_dimensions": [dimension + 1 for dimension in fine_cells] if fine_cells is not None else None,
+        "subgrid_texture_dimensions": (
+            [int(subgrid_texture.width), int(subgrid_texture.height), int(subgrid_texture.depth)]
+            if subgrid_texture is not None
+            else None
+        ),
+        "subgrid_size": subgrid_size,
+        "num_subgrids": int(texture_data.num_subgrids),
+        "paired_samples": bool(texture_data.paired_samples),
+    }
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -515,6 +846,12 @@ def _build_parser() -> argparse.ArgumentParser:
         description="Build a Newton texture SDF from an STL and export ParaView diagnostics with the native C++ writer."
     )
     parser.add_argument("--input", "--case", dest="input", type=Path, required=True, help="Input STL case file.")
+    parser.add_argument(
+        "--input-b",
+        type=Path,
+        default=None,
+        help="Optional second STL for dual-field intersection visualization; both STL files must share one world frame.",
+    )
     parser.add_argument("--output", type=Path, required=True, help="Output directory.")
     parser.add_argument(
         "--native-writer",
@@ -639,6 +976,12 @@ def main(argv: list[str] | None = None) -> int:
 
     print(f"[1/5] Loading STL: {input_path}")
     mesh, mesh_info = _load_stl(input_path, args.input_unit)
+    input_b_path = args.input_b.expanduser().resolve() if args.input_b is not None else None
+    mesh_b: newton.Mesh | None = None
+    mesh_b_info: dict[str, Any] | None = None
+    if input_b_path is not None:
+        print(f"  Loading second STL: {input_b_path}")
+        mesh_b, mesh_b_info = _load_stl(input_b_path, args.input_unit)
     print(
         f"  Vertices: {mesh_info['vertex_count']}, triangles: {mesh_info['triangle_count']}, "
         f"watertight: {mesh_info['watertight']}"
@@ -663,99 +1006,125 @@ def main(argv: list[str] | None = None) -> int:
             cache_dir=str(args.cache_dir.expanduser().resolve()) if args.cache_dir else None,
             paired_samples=not args.no_paired_samples,
         )
+        sdf_b = (
+            newton.SDF.create_from_mesh(
+                mesh_b,
+                device=device,
+                max_resolution=args.resolution,
+                target_voxel_size=args.target_voxel_size,
+                margin=args.margin,
+                narrow_band_range=(-args.narrow_band, args.narrow_band),
+                texture_format=args.texture_format,
+                sign_method=args.sign_method,
+                cache_dir=str(args.cache_dir.expanduser().resolve()) if args.cache_dir else None,
+                paired_samples=not args.no_paired_samples,
+            )
+            if mesh_b is not None
+            else None
+        )
     build_seconds = time.perf_counter() - build_start
-    print(f"  SDF build finished in {build_seconds:.3f} s")
+    print(f"  SDF build finished in {build_seconds:.3f} s" + (" (A + B)" if sdf_b is not None else ""))
 
     if sdf.is_empty() or sdf.to_texture_kernel_data() is None:
-        raise RuntimeError("SDF construction produced an empty texture SDF.")
+        raise RuntimeError("SDF A construction produced an empty texture SDF.")
+    if sdf_b is not None and (sdf_b.is_empty() or sdf_b.to_texture_kernel_data() is None):
+        raise RuntimeError("SDF B construction produced an empty texture SDF.")
+
+    if writer.cuda_enabled:
+        print("Native VTI export: direct Warp device pointer + chunked pinned-memory D2H")
+    else:
+        print("WARNING: native library has no CUDA Runtime support; VTI export will use Warp's host-copy fallback.")
 
     datasets: list[tuple[str, Path]] = []
     source_path = output_dir / "source_mesh.vtp"
     _write_vtp(writer, source_path, mesh.vertices, mesh.indices.reshape(-1, 3))
-    datasets.append(("Source STL mesh", source_path))
-    print(f"[3/5] Exported source mesh: {source_path}")
+    datasets.append(("Source STL mesh A", source_path))
+    if mesh_b is not None:
+        source_b_path = output_dir / "source_mesh_b.vtp"
+        _write_vtp(writer, source_b_path, mesh_b.vertices, mesh_b.indices.reshape(-1, 3))
+        datasets.append(("Source STL mesh B", source_b_path))
+    print(f"[3/5] Exported source mesh(es): {source_path}")
 
-    print("[4/5] Extracting Newton zero isosurface ...")
     extraction_start = time.perf_counter()
     zero_mesh = sdf.extract_isomesh(isovalue=args.isovalue, device=device)
-    extraction_seconds = time.perf_counter() - extraction_start
     zero_mesh_info: dict[str, Any]
     if zero_mesh is None or len(zero_mesh.indices) == 0:
         zero_mesh_info = {"extracted": False, "vertex_count": 0, "triangle_count": 0}
-        print("  WARNING: Newton returned an empty isosurface.")
+        print("  WARNING: Newton returned an empty zero isosurface for field A.")
     else:
-        zero_path = output_dir / "newton_zero_isosurface.vtp"
+        zero_path = output_dir / ("newton_zero_isosurface_a.vtp" if sdf_b is not None else "newton_zero_isosurface.vtp")
         zero_faces = np.asarray(zero_mesh.indices, dtype=np.int64).reshape(-1, 3)
         _write_vtp(writer, zero_path, zero_mesh.vertices, zero_faces)
-        datasets.append(("Newton extracted zero isosurface", zero_path))
+        datasets.append(("Newton zero isosurface A", zero_path))
         zero_mesh_info = {
             "extracted": True,
             "vertex_count": int(len(zero_mesh.vertices)),
             "triangle_count": int(len(zero_faces)),
             "isovalue_m": float(args.isovalue),
         }
-        print(
-            f"  Exported zero surface: {zero_path} "
-            f"({zero_mesh_info['vertex_count']} vertices, {zero_mesh_info['triangle_count']} triangles)"
-        )
+        print(f"  Exported field A zero surface: {zero_path}")
 
-    print("[5/5] Sampling the actual interpolated texture SDF ...")
+    zero_mesh_info_b: dict[str, Any] | None = None
+    if sdf_b is not None:
+        zero_mesh_b = sdf_b.extract_isomesh(isovalue=args.isovalue, device=device)
+        if zero_mesh_b is None or len(zero_mesh_b.indices) == 0:
+            zero_mesh_info_b = {"extracted": False, "vertex_count": 0, "triangle_count": 0}
+            print("  WARNING: Newton returned an empty zero isosurface for field B.")
+        else:
+            zero_path_b = output_dir / "newton_zero_isosurface_b.vtp"
+            zero_faces_b = np.asarray(zero_mesh_b.indices, dtype=np.int64).reshape(-1, 3)
+            _write_vtp(writer, zero_path_b, zero_mesh_b.vertices, zero_faces_b)
+            datasets.append(("Newton zero isosurface B", zero_path_b))
+            zero_mesh_info_b = {
+                "extracted": True,
+                "vertex_count": int(len(zero_mesh_b.vertices)),
+                "triangle_count": int(len(zero_faces_b)),
+                "isovalue_m": float(args.isovalue),
+            }
+            print(f"  Exported field B zero surface: {zero_path_b}")
+    extraction_seconds = time.perf_counter() - extraction_start
+
+    print("[5/5] Sampling interpolated texture SDF field(s) ...")
     sampling_start = time.perf_counter()
-    sample_datasets, sample_info = _export_sdf_diagnostics(
-        writer,
-        sdf,
-        output_dir,
-        device,
-        volume_resolution=args.volume_resolution,
-        slice_resolution=args.slice_resolution,
-        max_volume_points=args.max_volume_points,
-        max_slice_points=args.max_slice_points,
-        export_volume=not args.no_volume,
-        export_slices=not args.no_slices,
-    )
+    if sdf_b is None:
+        sample_datasets, sample_info = _export_sdf_diagnostics(
+            writer,
+            sdf,
+            output_dir,
+            device,
+            volume_resolution=args.volume_resolution,
+            slice_resolution=args.slice_resolution,
+            max_volume_points=args.max_volume_points,
+            max_slice_points=args.max_slice_points,
+            export_volume=not args.no_volume,
+            export_slices=not args.no_slices,
+        )
+    else:
+        sample_datasets, sample_info = _export_dual_sdf_diagnostics(
+            writer,
+            sdf,
+            sdf_b,
+            output_dir,
+            device,
+            volume_resolution=args.volume_resolution,
+            slice_resolution=args.slice_resolution,
+            max_volume_points=args.max_volume_points,
+            max_slice_points=args.max_slice_points,
+            export_volume=not args.no_volume,
+            export_slices=not args.no_slices,
+        )
     datasets.extend(sample_datasets)
     sampling_seconds = time.perf_counter() - sampling_start
 
     multiblock_path = output_dir / "case.vtm"
     _write_vtm(writer, multiblock_path, datasets, output_dir)
 
-    texture_data = sdf.to_texture_kernel_data()
-    coarse_texture = sdf._coarse_texture
-    subgrid_texture = sdf._subgrid_texture
-    coarse_texture_dimensions = (
-        [int(coarse_texture.width), int(coarse_texture.height), int(coarse_texture.depth)]
-        if coarse_texture is not None
-        else None
-    )
-    coarse_cell_dimensions = (
-        [dimension - 1 for dimension in coarse_texture_dimensions]
-        if coarse_texture_dimensions is not None
-        else None
-    )
-    subgrid_size = int(texture_data.subgrid_size)
-    fine_grid_cell_dimensions = (
-        [dimension * subgrid_size for dimension in coarse_cell_dimensions]
-        if coarse_cell_dimensions is not None
-        else None
-    )
-    sample_info["texture_layout"] = {
-        "coarse_texture_dimensions": coarse_texture_dimensions,
-        "coarse_cell_dimensions": coarse_cell_dimensions,
-        "fine_grid_cell_dimensions": fine_grid_cell_dimensions,
-        "fine_grid_sample_dimensions": (
-            [dimension + 1 for dimension in fine_grid_cell_dimensions]
-            if fine_grid_cell_dimensions is not None
-            else None
-        ),
-        "subgrid_texture_dimensions": (
-            [int(subgrid_texture.width), int(subgrid_texture.height), int(subgrid_texture.depth)]
-            if subgrid_texture is not None
-            else None
-        ),
-        "subgrid_size": subgrid_size,
-        "num_subgrids": int(texture_data.num_subgrids),
-        "paired_samples": bool(texture_data.paired_samples),
-    }
+    sample_info["texture_layout_a"] = _texture_layout_info(sdf)
+    if sdf_b is not None:
+        sample_info["texture_layout_b"] = _texture_layout_info(sdf_b)
+    else:
+        sample_info["texture_layout"] = sample_info.pop("texture_layout_a")
+
 
     metadata = {
         "tool": "Newton SDF Inspector",
@@ -763,8 +1132,16 @@ def main(argv: list[str] | None = None) -> int:
             "backend": "native C++17",
             "library": str(writer.library_path),
             "vtk_binary_encoding": "raw appended binary",
+            "cuda_device_pointer_export": writer.cuda_enabled,
         },
         "input": mesh_info,
+        "input_b": mesh_b_info,
+        "dual_field": {
+            "enabled": sdf_b is not None,
+            "composition": "max(field_a, field_b)" if sdf_b is not None else None,
+            "inside_convention": "negative",
+            "coordinate_frame": "shared world frame; no registration is applied",
+        },
         "build": {
             "device": str(device),
             "resolution": args.resolution,
@@ -779,10 +1156,12 @@ def main(argv: list[str] | None = None) -> int:
             "paired_samples": not args.no_paired_samples,
             "build_seconds": build_seconds,
             "isovalue_m": args.isovalue,
+            "field_b_built": sdf_b is not None,
         },
         "extraction": {
             **zero_mesh_info,
             "seconds": extraction_seconds,
+            **({"field_a": zero_mesh_info, "field_b": zero_mesh_info_b} if sdf_b is not None else {}),
         },
         "sampling": {
             **sample_info,
@@ -794,7 +1173,12 @@ def main(argv: list[str] | None = None) -> int:
             "VTK XML serialization is performed by the native C++17 writer using raw appended binary arrays (no Base64 encoding).",
             "The Newton zero isosurface is extracted by Newton's texture-SDF Marching Cubes path.",
             "STL has no physical-unit metadata; input coordinates were scaled according to input_unit.",
-            "This diagnostic currently visualizes the existing single-field Newton SDF path; it does not yet visualize the experimental dual-field sampler.",
+            (
+                "Dual-field mode independently interpolates A and B, then composes max(A, B); use Contour(0) on sdf_combined.vti for the combined zero surface."
+                if sdf_b is not None
+                else "Single-field mode exports the Newton texture SDF."
+            ),
+            "The native CUDA writer copies device samples in bounded pinned-memory chunks on the active Warp stream when built with CUDA Runtime support.",
         ],
     }
     metadata_path = output_dir / "metadata.json"
@@ -804,25 +1188,35 @@ def main(argv: list[str] | None = None) -> int:
         "Newton SDF Inspector output",
         "",
         "VTK files are serialized by the native C++17 writer. Scalar-field sampling runs on the CUDA device through Newton's Warp kernel.",
+        "When built with CUDA Runtime support, the writer receives the Warp device pointer and performs chunked D2H copies using pinned host buffers.",
         "",
         "1. Open case.vtm in ParaView to load all exported datasets together.",
-        "2. Toggle Source STL mesh and Newton extracted zero isosurface to compare geometry.",
+        "2. Toggle source meshes and extracted zero isosurfaces to compare geometry.",
     ]
     if not args.no_volume:
-        readme_lines.extend([
-            "3. Select sdf_volume.vti and apply the Contour filter with value 0.0 to extract",
-            "   the zero level set from the sampled interpolated SDF.",
-        ])
+        if sdf_b is None:
+            readme_lines.extend([
+                "3. Select sdf_volume.vti and apply the Contour filter with value 0.0 to extract",
+                "   the zero level set from the sampled interpolated SDF.",
+            ])
+        else:
+            readme_lines.extend([
+                "3. Compare sdf_field_a.vti and sdf_field_b.vti independently.",
+                "4. Select sdf_combined.vti and apply Contour with value 0.0 to inspect max(A, B).",
+                "   The two fields are interpolated independently before the intersection composition.",
+            ])
     if not args.no_slices:
         readme_lines.extend([
-            "4. Open the three files under slices/ to inspect signed-distance cross sections.",
+            "5. Open the files under slices/ to inspect signed-distance cross sections.",
             "   Color by signed_distance_m; the material side should be negative for a correctly",
             "   oriented closed solid.",
         ])
     readme_lines.extend([
-        "5. Check metadata.json for mesh watertightness, SDF parameters, texture layout,",
+        "6. Check metadata.json for mesh watertightness, SDF parameters, texture layout,",
         "   sample dimensions, and value ranges.",
         "",
+        "For dual-field runs, --input-b must use the same world coordinate frame and units as --input.",
+        "The combined field uses max(A, B), which represents intersection when both fields are negative inside.",
         "The full 3-D volume is capped by --max-volume-points. Center slices use",
         "--slice-resolution and --max-slice-points. Increase SDF resolution or reduce",
         "target voxel size to improve the actual SDF; increasing visualization sampling",

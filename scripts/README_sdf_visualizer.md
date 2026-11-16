@@ -10,7 +10,38 @@
 uv sync --extra importers
 ```
 
-STL 读取依赖 `trimesh`，它包含在 `importers` extra 中。ParaView 可视化不依赖 VTK Python、PyVista 或其他额外 Python 包。
+STL 读取依赖 `trimesh`，它包含在 `importers` extra 中。ParaView 可视化不依赖 VTK Python 或 PyVista。
+
+### 编译原生 C++ 导出器（必须）
+
+VTK 文件写入已从 Python 迁移到独立的 C++17 动态库。先在仓库根目录编译：
+
+Linux：
+
+```bash
+cmake -S scripts/sdf_visualizer -B scripts/sdf_visualizer/build -DCMAKE_BUILD_TYPE=Release
+cmake --build scripts/sdf_visualizer/build --parallel
+ctest --test-dir scripts/sdf_visualizer/build --output-on-failure
+```
+
+Windows（Visual Studio 生成器）：
+
+```powershell
+cmake -S scripts/sdf_visualizer -B scripts/sdf_visualizer/build -A x64
+cmake --build scripts/sdf_visualizer/build --config Release --parallel
+ctest --test-dir scripts/sdf_visualizer/build -C Release --output-on-failure
+```
+
+默认情况下，Python 入口会自动查找 `scripts/sdf_visualizer/build` 中的动态库。也可以通过 `--native-writer` 或环境变量 `NEWTON_SDF_VTK_WRITER_LIBRARY` 指定库路径。
+
+C++ 导出器直接从连续内存缓冲区写入 VTK XML 的 raw-appended binary 数据，不执行 Base64 编码，也不构造大型 Python XML/bytes 副本。写入采用临时文件后重命名，避免中断时留下半个最终文件。
+
+### 计算与 I/O 的职责边界
+
+- SDF 构建继续调用 Newton 的现有 API。
+- 三维场和切片采样继续运行在 Warp CUDA kernel 上，直接调用 Newton 的 `texture_sample_sdf`，不会在 CPU 上重新计算距离场。
+- VTP/VTI/VTM 序列化由 C++17 动态库完成。
+- GPU 采样结果仍需传输到主机内存后写入普通文件；这次迁移消除了 Python Base64/XML 序列化开销，但不会消除必要的 GPU→CPU 数据传输。
 
 ## 快速开始
 
